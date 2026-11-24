@@ -6960,6 +6960,49 @@ fn gpu_signed_bfe_arithmetic_shift() {
 }
 
 #[test]
+fn gpu_integer_multiply_high() {
+    const CASES: [(u32, u32); 9] = [
+        (0, u32::MAX),
+        (1, u32::MAX),
+        (0x0000_FFFF, 0x0000_FFFF),
+        (0x0001_0000, 0x0001_0000),
+        (0x0001_FFFF, 0x0001_FFFF),
+        (u32::MAX, u32::MAX),
+        (0x8000_0000, 0x8000_0000),
+        (0x8000_0000, 0x7FFF_FFFF),
+        (0x1234_FEDC, 0xFEDC_1234),
+    ];
+    let unsigned_high = |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32;
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1)], None),
+            ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", V + 1)], None),
+            // Compare a separate product with zero and discard its high word. DXC used to emit
+            // invalid DXIL for this use when the unsigned multiply was lowered via uint64_t.
+            ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 2), ("SRC1", V + 3)], None),
+            ("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 6)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+        ]);
+        let mut st = KernelState::default();
+        for (l, regs) in st.vgpr.iter_mut().enumerate() {
+            (regs[0], regs[1]) = CASES[l % CASES.len()];
+            (regs[2], regs[3]) = CASES[(l + 1) % CASES.len()];
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, regs) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b) = CASES[l % CASES.len()];
+            let signed_high = ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32;
+            assert_eq!(regs[4], unsigned_high(a, b), "wave{lanes} lane {l} v_mul_hi_u32({a:#010x}, {b:#010x})");
+            assert_eq!(regs[5], signed_high, "wave{lanes} lane {l} v_mul_hi_i32({a:#010x}, {b:#010x})");
+
+            let (a, b) = CASES[(l + 1) % CASES.len()];
+            let vcc_bit = (r.sgpr[106 + l / 32] >> (l % 32)) & 1;
+            assert_eq!(vcc_bit, u32::from(unsigned_high(a, b) != 0), "wave{lanes} lane {l} v_mul_hi_u32({a:#010x}, {b:#010x}) != 0");
+        }
+    }
+}
+
+#[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
         let p = prog(&[
