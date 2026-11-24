@@ -1097,6 +1097,57 @@ fn gpu_clamp_and_omod_per_instruction() {
     }
 }
 
+/// Compare signed and unsigned packed minima and maxima with matching and crossed halves.
+#[test]
+fn gpu_packed_16bit_min_max() {
+    const OPS: [&str; 4] = ["V_PK_MIN_I16", "V_PK_MAX_I16", "V_PK_MIN_U16", "V_PK_MAX_U16"];
+    const CASES: [([u16; 2], [u16; 2]); 8] = [
+        ([0x8000, 0xFFFF], [0x7FFF, 0]),
+        ([0x7FFF, 0], [0x8000, 0xFFFF]),
+        ([0x8000, 0x8000], [0x8000, 1]),
+        ([0, 0x7FFF], [0, 0x7FFF]),
+        ([0x1234, 0xABCD], [0x2468, 0x9876]),
+        ([0xABCD, 0x1234], [0x9876, 0x2468]),
+        ([0xFFFF, 1], [0x8001, 2]),
+        ([1, 0x8001], [0xFFFF, 2]),
+    ];
+    let pack = |[lo, hi]: [u16; 2]| u32::from(lo) | (u32::from(hi) << 16);
+    let mut st = KernelState::default();
+    for (registers, &(a, b)) in st.vgpr.iter_mut().zip(CASES.iter().cycle()) {
+        (registers[0], registers[1]) = (pack(a), pack(b));
+    }
+
+    for wave64 in gpu_waves() {
+        // Only SRC1 changes halves: lo uses SRC1.hi and hi uses SRC1.lo when crossed.
+        for (op_sel, op_sel_hi, crossed) in [(0, 3, false), (2, 1, true)] {
+            let fields = |vdst| [("VDST", vdst), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", op_sel), ("OP_SEL_HI", op_sel_hi)];
+            let code = prog(&[
+                (OPS[0], "ENC_VOP3P", &fields(2), None),
+                (OPS[1], "ENC_VOP3P", &fields(3), None),
+                (OPS[2], "ENC_VOP3P", &fields(4), None),
+                (OPS[3], "ENC_VOP3P", &fields(5), None),
+            ]);
+            let (result, lanes) = run_wave(&code, &st, wave64);
+            for (lane, (registers, &(a, mut b))) in result.vgpr.iter().zip(CASES.iter().cycle()).take(lanes).enumerate() {
+                if crossed {
+                    b.swap(0, 1);
+                }
+                let [a_lo, a_hi] = a.map(|value| value as i16);
+                let [b_lo, b_hi] = b.map(|value| value as i16);
+                let expected = [
+                    pack([a_lo.min(b_lo) as u16, a_hi.min(b_hi) as u16]),
+                    pack([a_lo.max(b_lo) as u16, a_hi.max(b_hi) as u16]),
+                    pack([a[0].min(b[0]), a[1].min(b[1])]),
+                    pack([a[0].max(b[0]), a[1].max(b[1])]),
+                ];
+                for (i, (&op, want)) in OPS.iter().zip(expected).enumerate() {
+                    assert_eq!(registers[2 + i], want, "wave{lanes} lane {lane} {op} crossed={crossed}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {
