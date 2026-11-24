@@ -952,6 +952,43 @@ fn ldexp_f64(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// Saturate each signed half independently and pack the two bytes into a cleared dword.
+#[test]
+fn gpu_sat_pk_u8_i16_clamps_signed_halves() {
+    const CASES: [(i16, i16); 12] = [
+        (i16::MIN, i16::MAX),
+        (i16::MAX, i16::MIN),
+        (-1, 0),
+        (0, -1),
+        (1, 255),
+        (255, 1),
+        (254, 256),
+        (256, 254),
+        (127, 128),
+        (128, 127),
+        (-256, 256),
+        (256, -256),
+    ];
+    let code = prog(&[
+        ("V_SAT_PK_U8_I16", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_SAT_PK_U8_I16", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (registers, &(lo, hi)) in st.vgpr.iter_mut().zip(CASES.iter().cycle()) {
+        registers[0] = u32::from(lo as u16) | (u32::from(hi as u16) << 16);
+        registers[1] = 0xA5A5_5A5A;
+    }
+    let sat = |value: i16| value.clamp(0, i16::from(u8::MAX)) as u8;
+    for wave64 in gpu_waves() {
+        let (result, lanes) = run_wave(&code, &st, wave64);
+        for (lane, (registers, &(lo, hi))) in result.vgpr.iter().zip(CASES.iter().cycle()).take(lanes).enumerate() {
+            let expected = u32::from_le_bytes([sat(lo), sat(hi), 0, 0]);
+            assert_eq!(registers[1], expected, "wave{lanes} lane {lane}: separate destination for ({lo}, {hi})");
+            assert_eq!(registers[0], expected, "wave{lanes} lane {lane}: in-place destination for ({lo}, {hi})");
+        }
+    }
+}
+
 #[test]
 fn gpu_valu_float_and_int() {
     if !gpu_ready() {
