@@ -2652,6 +2652,54 @@ fn gpu_dword_addtid_per_lane_addresses() {
     }
 }
 
+/// The compact dot instructions add the packed products to the old destination.
+#[test]
+fn gpu_dot_accumulates_destination() {
+    const HALVES: [(u16, f32); 8] = [
+        (0x0000, 0.0), (0x3800, 0.5), (0x3C00, 1.0), (0xBC00, -1.0),
+        (0x4000, 2.0), (0xC200, -3.0), (0x4300, 3.5), (0xB400, -0.25),
+    ];
+    const BYTES: [(u32, u32); 8] = [
+        (0x7F80_01FF, 0x807F_FF02),
+        (0x8080_8080, 0x8080_8080),
+        (0x7F7F_7F7F, 0x8080_8080),
+        (0, u32::MAX),
+        (0x00FF_8001, 0x04FD_02FE),
+        (0x0102_0304, 0x05FA_07F8),
+        (0xFFFE_FDFC, 0x0506_0708),
+        (0x1234_5678, 0x89AB_CDEF),
+    ];
+    let code = prog(&[
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 4), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_DOT4C_I32_I8", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 2), ("VSRC1", 3)], None),
+    ]);
+    let pack = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
+    let mut st = KernelState::default();
+    let mut expected = Vec::with_capacity(st.vgpr.len());
+    for (lane, registers) in st.vgpr.iter_mut().enumerate() {
+        let a = [HALVES[lane % 8], HALVES[(lane + 3) % 8]];
+        let b = [HALVES[(3 * lane + 1) % 8], HALVES[(5 * lane + 2) % 8]];
+        let (x, y) = BYTES[lane % BYTES.len()];
+        // These small binary fractions keep both products and accumulator additions exact.
+        let float_acc = 0.5 * lane as f32 - 7.75;
+        let int_acc = 71 * lane as i32 - 1023;
+        registers[..6].copy_from_slice(&[
+            pack(a[0].0, a[1].0), pack(b[0].0, b[1].0), x, y, float_acc.to_bits(), int_acc as u32,
+        ]);
+        let dot2 = a[0].1 * b[0].1 + a[1].1 * b[1].1;
+        let dot4: i32 = x.to_le_bytes().into_iter().zip(y.to_le_bytes())
+            .map(|(a, b)| i32::from(a as i8) * i32::from(b as i8)).sum();
+        expected.push(((dot2 + float_acc).to_bits(), dot4 + int_acc));
+    }
+    for wave64 in gpu_waves() {
+        let (result, lanes) = run_wave(&code, &st, wave64);
+        for (lane, (registers, &(float, int))) in result.vgpr.iter().zip(&expected).take(lanes).enumerate() {
+            assert_eq!(registers[4], float, "wave{lanes} lane {lane} V_DOT2C_F32_F16");
+            assert_eq!(registers[5] as i32, int, "wave{lanes} lane {lane} V_DOT4C_I32_I8");
+        }
+    }
+}
+
 #[test]
 fn gpu_valu_16_and_64_bit() {
     if !gpu_ready() {
