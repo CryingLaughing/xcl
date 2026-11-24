@@ -6919,6 +6919,49 @@ fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
 }
 
 #[test]
+fn gpu_vop1_bit_scan_and_reverse() {
+    const WORDS: [u32; 12] = [
+        0,
+        u32::MAX,
+        1,
+        2,
+        0x0001_0000,
+        0x4000_0000,
+        0x7fff_ffff,
+        0x8000_0000,
+        0x8000_0001,
+        0xffff_fffe,
+        0x0123_4568,
+        0xabc0_1230,
+    ];
+    let p = prog(&[
+        ("V_FFBH_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_FFBL_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("V_FFBH_I32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V)], None),
+        ("V_BFREV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+        regs[0] = WORDS[lane % WORDS.len()];
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, regs) in r.vgpr.iter().take(lanes).enumerate() {
+            let word = st.vgpr[lane][0];
+            let high = if word == 0 { u32::MAX } else { word.leading_zeros() };
+            let low = if word == 0 { u32::MAX } else { word.trailing_zeros() };
+            // The signed scan counts bits equal to the sign before the first differing bit.
+            let signed_bits = if (word as i32) < 0 { !word } else { word };
+            let signed_high = if signed_bits == 0 { u32::MAX } else { signed_bits.leading_zeros() };
+            assert_eq!(regs[1], high, "wave{lanes} lane {lane} v_ffbh_u32({word:#010x})");
+            assert_eq!(regs[2], low, "wave{lanes} lane {lane} v_ffbl_b32({word:#010x})");
+            assert_eq!(regs[3], signed_high, "wave{lanes} lane {lane} v_ffbh_i32({word:#010x})");
+            assert_eq!(regs[4], word.reverse_bits(), "wave{lanes} lane {lane} v_bfrev_b32({word:#010x})");
+        }
+    }
+}
+
+#[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {
         let p = prog(&[
