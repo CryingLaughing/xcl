@@ -2711,6 +2711,49 @@ fn gpu_packed_math_dots_movrel() {
     }
 }
 
+/// Right shifts cross the register boundary and use only the low six count bits.
+#[test]
+fn gpu_64bit_right_shifts() {
+    const NEGATIVE: u64 = 0xFEDC_BA98_7654_3210;
+    const CASES: [(u64, u32); 14] = [
+        (NEGATIVE, 0),
+        (NEGATIVE, 1),
+        (NEGATIVE, 31),
+        (NEGATIVE, 32),
+        (NEGATIVE, 33),
+        (0x8000_0000_0000_0000, 63),
+        (0x1234_5678_9ABC_DEF0, 64),
+        (NEGATIVE, 65),
+        (0x8000_0000_0000_0001, 127),
+        (0x7FFF_FFFF_FFFF_FFFF, 32),
+        (0x0000_0000_8000_0000, 31),
+        (u64::MAX, u32::MAX),
+        (0, 32),
+        (1, 1),
+    ];
+    let code = prog(&[
+        ("V_LSHRREV_B64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2)], None),
+        ("V_ASHRREV_I64", "ENC_VOP3", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 2)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (registers, &(value, count)) in st.vgpr.iter_mut().zip(CASES.iter().cycle()) {
+        registers[0] = count;
+        registers[2] = value as u32;
+        registers[3] = (value >> 32) as u32;
+    }
+    let pair = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
+    for wave64 in gpu_waves() {
+        let (result, lanes) = run_wave(&code, &st, wave64);
+        for (lane, (registers, &(value, count))) in result.vgpr.iter().zip(CASES.iter().cycle()).take(lanes).enumerate() {
+            let shift = count & 63;
+            let logical = (u128::from(value) >> shift) as u64;
+            let arithmetic = (i128::from(value as i64) >> shift) as u64;
+            assert_eq!(pair(registers[4], registers[5]), logical, "wave{lanes} lane {lane} V_LSHRREV_B64({value:#018x}, {count})");
+            assert_eq!(pair(registers[6], registers[7]), arithmetic, "wave{lanes} lane {lane} V_ASHRREV_I64({value:#018x}, {count})");
+        }
+    }
+}
+
 #[test]
 fn dxc_mesh_shader_probe() {
     use super::dxc;
