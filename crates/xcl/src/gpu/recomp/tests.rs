@@ -1344,6 +1344,41 @@ fn gpu_grouped_loads_bounds_and_inactive_lanes() {
     }
 }
 
+/// The CBV descriptor used by CreateConstantBufferView selects 16-byte rows for idxen loads.
+#[test]
+fn gpu_cbv_indexed_loads_select_float4_rows() {
+    const BASE: usize = 0x100;
+    const ROWS: [[u32; 4]; 4] = [
+        [0x0100, 0x0101, 0x0102, 0x0103],
+        [0x0200, 0x0201, 0x0202, 0x0203],
+        [0x0300, 0x0301, 0x0302, 0x0303],
+        [0x0400, 0x0401, 0x0402, 0x0403],
+    ];
+    let code = prog(&[
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("IDXEN", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    let bytes = std::mem::size_of_val(&ROWS) as u32;
+    st.sgpr[..4].copy_from_slice(&crate::gpu::desc::cbv_words(BASE as u64, bytes));
+    for (lane, registers) in st.vgpr.iter_mut().enumerate() {
+        registers[0] = (lane % (ROWS.len() + 1)) as u32;
+    }
+    for wave64 in gpu_waves() {
+        let (dxil, mut mem) = kernel_wave(&code, wave64);
+        mem.resize(BASE / 4, 0);
+        mem.extend(ROWS.iter().flatten().copied());
+        // The fifth row is backed by memory but is outside the descriptor's record count.
+        mem.extend([0xDEAD_BEEF; 4]);
+        let result = runner::run(&dxil, &st, &mem).unwrap();
+        let lanes = if wave64 { 64 } else { 32 };
+        for (lane, registers) in result.vgpr.iter().take(lanes).enumerate() {
+            let row = st.vgpr[lane][0] as usize;
+            let want = ROWS.get(row).copied().unwrap_or([0; 4]);
+            assert_eq!(&registers[4..8], &want, "wave{lanes} lane {lane}: indexed CBV row {row}");
+        }
+    }
+}
+
 /// A real console vertex shader from the retail pack, run on the PC GPU
 /// (needs XCL_SAMPLE_RPF=…\shaders.rpf).
 #[test]
