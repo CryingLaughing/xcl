@@ -631,6 +631,40 @@ fn gpu_cvt_norm_f16_exact_rounding_and_edge_cases() {
     }
 }
 
+/// Packing selects one half from each source and preserves those bits.
+#[test]
+fn gpu_pack_b32_f16_selects_source_halves() {
+    const CASES: [([u32; 2], [u32; 4]); 8] = [
+        // Two source words, then expected results for OP_SEL = 0, 1, 2 and 3.
+        ([0x8000_0000, 0xFC00_7C00], [0x7C00_0000, 0x7C00_8000, 0xFC00_0000, 0xFC00_8000]),
+        ([0x7E35_0001, 0x8001_FE42], [0xFE42_0001, 0xFE42_7E35, 0x8001_0001, 0x8001_7E35]),
+        ([0x7BFF_FBFF, 0x03FF_83FF], [0x83FF_FBFF, 0x83FF_7BFF, 0x03FF_FBFF, 0x03FF_7BFF]),
+        ([0x3555_C000, 0x4400_B800], [0xB800_C000, 0xB800_3555, 0x4400_C000, 0x4400_3555]),
+        ([0x0400_8400, 0x3C00_BC00], [0xBC00_8400, 0xBC00_0400, 0x3C00_8400, 0x3C00_0400]),
+        ([0xC200_4300, 0x8002_0002], [0x0002_4300, 0x0002_C200, 0x8002_4300, 0x8002_C200]),
+        ([0x7FFF_7E00, 0xFFFF_FE00], [0xFE00_7E00, 0xFE00_7FFF, 0xFFFF_7E00, 0xFFFF_7FFF]),
+        ([0xBC02_3C01, 0xBE04_3E03], [0x3E03_3C01, 0x3E03_BC02, 0xBE04_3C01, 0xBE04_BC02]),
+    ];
+    let code = prog(&[
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 1)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 2)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 3)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (registers, (inputs, _)) in st.vgpr.iter_mut().zip(CASES.iter().cycle()) {
+        registers[..2].copy_from_slice(inputs);
+    }
+    for wave64 in gpu_waves() {
+        let (result, lanes) = run_wave(&code, &st, wave64);
+        for (lane, (registers, (_, expected))) in result.vgpr.iter().zip(CASES.iter().cycle()).take(lanes).enumerate() {
+            for (selector, &want) in expected.iter().enumerate() {
+                assert_eq!(registers[2 + selector], want, "wave{lanes} lane {lane}: V_PACK_B32_F16 OP_SEL={selector}");
+            }
+        }
+    }
+}
+
 /// The f64 frexp pair: v_frexp_mant_f64 (m in [0.5,1) keeping the sign, input back for
 /// 0/inf/NaN) → an f64 pair, v_frexp_exp_i32_f64 (input = m·2^exp, 0 for 0/inf/NaN) → one
 /// dword. VOP1 and VOP3 (source abs/neg come from the f64 modifiers). Emitted text is
