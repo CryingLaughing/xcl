@@ -3445,12 +3445,21 @@ mod driver_cache {
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static SKIP_DISK_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
         format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+        #[cfg(test)]
+        if SKIP_DISK_FOR_TEST.get() {
+            return None;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
     }
@@ -3564,9 +3573,20 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/support/console_cs.rs"]
+mod console_cs_fixture;
+
+#[cfg(test)]
 mod compute_blob_tests {
+    use super::*;
+    use crate::gpu::recomp::{dxc, pso::Stage, runner};
+    use std::cell::{Cell, RefCell};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dxil = vec![7u8; 1000];
         let key = super::compute_blob_key(&dxil, 0x1000, 0);
         assert_eq!(key, super::compute_blob_key(&dxil.clone(), 0x1000, 0));
@@ -3586,6 +3606,129 @@ mod compute_blob_tests {
         super::forget_compute_blob(key);
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+    }
+
+    thread_local! {
+        static CACHED_SIZES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static REJECT_CACHED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    unsafe extern "system" fn record_compute_build(this: *mut c_void, desc: *const c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        let size = (*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CachedPSO.CachedBlobSizeInBytes;
+        CACHED_SIZES.with(|sizes| sizes.borrow_mut().push(size));
+        if size != 0 && REJECT_CACHED.with(Cell::get) {
+            return E_INVALIDARG;
+        }
+        let original: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+        original(this, desc, iid, out)
+    }
+
+    struct RestoreDiskCache(bool);
+
+    impl Drop for RestoreDiskCache {
+        fn drop(&mut self) {
+            driver_cache::SKIP_DISK_FOR_TEST.set(self.0);
+        }
+    }
+
+    unsafe fn build(device: *mut c_void, program: &[u8], reject_cached: bool) -> (ID3D12PipelineState, Vec<usize>) {
+        // Another run of this fixture may already have saved the same program on disk.
+        let _disk = RestoreDiskCache(driver_cache::SKIP_DISK_FOR_TEST.replace(true));
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(program), ..Default::default() };
+        CACHED_SIZES.with(|sizes| sizes.borrow_mut().clear());
+        REJECT_CACHED.with(|reject| reject.set(reject_cached));
+        let mut pso = std::ptr::null_mut();
+        let hr = translated_compute_pso(device, record_compute_build, (&raw const desc).cast(), &pc_iid(Kind::PipelineState), &mut pso);
+        REJECT_CACHED.with(|reject| reject.set(false));
+        let sizes = CACHED_SIZES.with(|sizes| std::mem::take(&mut *sizes.borrow_mut()));
+        let hr = hr.expect("translated console compute PSO").expect("driver build or fallback");
+        assert!(hr >= 0 && !pso.is_null(), "compute PSO build failed ({hr:#x})");
+        (ID3D12PipelineState::from_raw(pso), sizes)
+    }
+
+    fn word(index: usize) -> u32 {
+        (index as u32).wrapping_mul(0x9E37_79B9) ^ 0xA15C_7E3D
+    }
+
+    fn synthetic_stores(count: usize) -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut emit = |name: &str, enc: &str, fields: &[(&str, u64)], literal| {
+            code.extend(crate::gpu::rdna2::encode(name, enc, fields, literal).unwrap_or_else(|e| panic!("{name}: {e}")));
+        };
+        // Only lane zero writes. Permute destinations to keep adjacent writes from coalescing.
+        emit("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 129)], None);
+        emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 128)], None);
+        for i in 0..count {
+            let index = (i * 257) % count;
+            emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(((index + 1) * 4) as u32));
+            emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255)], Some(word(index)));
+            emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 4), ("SADDR", 0x7D)], None);
+        }
+        emit("S_ENDPGM", "ENC_SOPP", &[], None);
+        code
+    }
+
+    struct RemoveBlob((u64, usize, i32));
+
+    impl Drop for RemoveBlob {
+        fn drop(&mut self) {
+            forget_compute_blob(self.0);
+        }
+    }
+
+    #[test]
+    fn gpu_compute_driver_blob_is_reused_and_replaced_after_rejection() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        if crate::hle::d3d12x::backend() != crate::hle::d3d12x::Backend::Real {
+            return runner::skip_test("no GPU");
+        }
+        if runner::wave64_programs_supported() != Ok(true) {
+            return runner::skip_test("no wave64");
+        }
+        println!("D3D12 adapter: {}", stats().adapter);
+
+        let raw = device_raw();
+        unsafe {
+            let dev = ID3D12Device::from_raw_borrowed(&raw).expect("real D3D12 device");
+            let split = wave32_only(raw);
+            let (count, program, compiled) = [512, 1024, 2048].into_iter().find_map(|count| {
+                let program = console_cs_fixture::console_cs(&synthetic_stores(count), 0, [64, 1, 1]);
+                let compiled = crate::gpu::recomp::pso::console_to_dxil_for(&program, Stage::Compute, 0, split)
+                    .expect("translate synthetic compute shader");
+                (compiled.dxil.len() >= COMPUTE_BLOB_MIN_DXIL).then_some((count, program, compiled))
+            }).expect("synthetic DXIL must reach the driver-blob cache threshold");
+            let root = abi_rs_for(raw, &compiled.samplers).expect("compute ABI root signature");
+            let key = compute_blob_key(&compiled.dxil, root as usize, 0);
+            let _cleanup = RemoveBlob(key);
+            assert!(compute_blob(key).is_none(), "fixture must start with a cold driver cache");
+
+            let (cold, cold_calls) = build(raw, &program, false);
+            assert_eq!(cold_calls, [0]);
+            if compute_blob(key).is_none() && cold.GetCachedBlob().map_or(true, |blob| blob.GetBufferSize() == 0) {
+                return runner::skip_test("no driver PSO cache blob");
+            }
+            let cached = compute_blob(key).expect("cold build must cache the real driver blob");
+            assert!(!cached.is_empty());
+
+            let (_warm, warm_calls) = build(raw, &program, false);
+            assert!(warm_calls == [cached.len()] || warm_calls == [cached.len(), 0], "unexpected warm driver calls: {warm_calls:?}");
+            let before_rejection = compute_blob(key).expect("warm build must leave a driver blob");
+            let (fallback, rejection_calls) = build(raw, &program, true);
+            assert_eq!(rejection_calls, [before_rejection.len(), 0], "a rejected cached build must retry without a blob");
+            let replacement = compute_blob(key).expect("fallback build must cache its new driver blob");
+            assert!(!std::sync::Arc::ptr_eq(&before_rejection, &replacement), "fallback must replace the rejected blob");
+            println!("{} B DXIL; cached bytes per cold/warm/rejected call: {cold_calls:?} / {warm_calls:?} / {rejection_calls:?}", compiled.dxil.len());
+
+            let rs = ID3D12RootSignature::from_raw_borrowed(&root).expect("compute ABI root signature");
+            let result = runner::dispatch_on(dev, &fallback, rs, [1, 1, 1], &[], &vec![0; count + 1]).expect("dispatch fallback PSO");
+            assert_eq!(result[0], 0);
+            for (index, &value) in result[1..=count].iter().enumerate() {
+                assert_eq!(value, word(index), "fallback PSO output word {index}");
+            }
+        }
     }
 }
 
