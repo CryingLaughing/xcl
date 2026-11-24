@@ -2663,6 +2663,45 @@ fn gpu_valu_16_and_64_bit() {
     assert_eq!(r.sgpr[22] as u64 | (r.sgpr[23] as u64) << 32, carries, "v_mad_u64_u32 carry mask");
 }
 
+/// Packed shifts use the low four count bits from each selected half. Only ASHR extends the sign.
+#[test]
+fn gpu_packed_16bit_shifts() {
+    const CASES: [(u16, u16, u16, u16); 8] = [
+        // Low count, high count, low value, high value.
+        (0, 15, 0x1357, 0x8001),
+        (15, 0, 0x8001, 0x2468),
+        (16, 31, 0x8000, 0x7FFF),
+        (31, 16, 0x7FFF, 0x8000),
+        (1, 4, 0xA55A, 0x369C),
+        (20, 3, 0x5AA5, 0xC963),
+        (7, 31, 0xFFFF, 0x0000),
+        (31, 7, 0x0000, 0xFFFF),
+    ];
+    // OP_SEL defaults to zero (both low halves); OP_SEL_HI selects both high halves.
+    let code = prog(&[
+        ("V_PK_LSHLREV_B16", "ENC_VOP3P", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+        ("V_PK_LSHRREV_B16", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+        ("V_PK_ASHRREV_I16", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+    ]);
+    let pack = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
+    let mut st = KernelState::default();
+    for (registers, &(count_lo, count_hi, lo, hi)) in st.vgpr.iter_mut().zip(CASES.iter().cycle()) {
+        (registers[0], registers[1]) = (pack(count_lo, count_hi), pack(lo, hi));
+    }
+    for wave64 in gpu_waves() {
+        let (result, lanes) = run_wave(&code, &st, wave64);
+        for (lane, (registers, &(count_lo, count_hi, lo, hi))) in result.vgpr.iter().zip(CASES.iter().cycle()).take(lanes).enumerate() {
+            let shift_lo = count_lo & 15;
+            let shift_hi = count_hi & 15;
+            let signed_lo = ((lo as i16) >> shift_lo) as u16;
+            let signed_hi = ((hi as i16) >> shift_hi) as u16;
+            assert_eq!(registers[2], pack(lo << shift_lo, hi << shift_hi), "wave{lanes} lane {lane} V_PK_LSHLREV_B16");
+            assert_eq!(registers[3], pack(lo >> shift_lo, hi >> shift_hi), "wave{lanes} lane {lane} V_PK_LSHRREV_B16");
+            assert_eq!(registers[4], pack(signed_lo, signed_hi), "wave{lanes} lane {lane} V_PK_ASHRREV_I16");
+        }
+    }
+}
+
 #[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
