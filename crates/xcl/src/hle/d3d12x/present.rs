@@ -854,18 +854,15 @@ impl Compositor {
         slot: usize,
     ) -> bool {
         let first = slot % PRESENT_SLOTS * MAX_PLANES;
-        // Flip-model storage is UNORM. An sRGB view blends linear samples and encodes the
-        // stored RGB when every drawn plane explicitly carries the sRGB transfer function.
-        let rtv_format = if planes.len() > 1 && planes.iter().take(MAX_PLANES).all(|(_, desc, _)| {
-            matches!(desc.Format, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
-        }) {
-            match dst_fmt {
-                DXGI_FORMAT_R8G8B8A8_UNORM => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                DXGI_FORMAT_B8G8R8A8_UNORM => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        // The first plane supplies the swap format and is drawn as the opaque base.
+        // Retain its sRGB encoding even when overlays use a linear SRV.
+        let rtv_format = match planes {
+            [(_, base, _), _, ..] => match (base.Format, dst_fmt) {
+                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM) => base.Format,
+                (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM) => base.Format,
                 _ => dst_fmt,
-            }
-        } else {
-            dst_fmt
+            },
+            _ => dst_fmt,
         };
         let Some((opaque_pso, blend_pso)) = self.psos_for(dev, rtv_format) else { return false };
         let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
@@ -1751,12 +1748,21 @@ mod frame_dump_tests {
                 r.unwrap()
             };
             let cases = [
-                (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, [0, 0, 255, 255], [0, 128, 0, 128], [0, 128, 127, 255]),
+                (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    [0, 0, 255, 255], [0, 128, 0, 128], [0, 128, 127, 255]),
                 // Offscreen typeless storage supports either view of the same format family.
-                // The fractional overlay encodes a premultiplied linear green of about 0.25.
-                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS, [188, 128, 0, 255], [0, 137, 0, 128], [137, 161, 0, 255]),
+                // Both 137 sRGB and 64 UNORM encode premultiplied green of about 0.25.
+                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                    [188, 128, 0, 255], [0, 137, 0, 128], [137, 161, 0, 255]),
+                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                    [188, 128, 0, 255], [0, 64, 0, 128], [137, 161, 0, 255]),
+                (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                    [0, 0, 255, 255], [0, 137, 0, 128], [0, 64, 127, 255]),
+                (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS,
+                    [188, 128, 0, 255], [0, 64, 0, 128], [137, 161, 0, 255]),
             ];
-            for (format, target_format, scene_color, blend_color, expected_blend) in cases {
+            for (scene_format, ui_format, target_format, scene_color, blend_color, expected_blend) in cases {
+                let output_format = swap_format(scene_format).unwrap();
                 let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
                 let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
                 let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
@@ -1772,8 +1778,8 @@ mod frame_dump_tests {
                     crate::gpu::texture::record_upload(&dev, &list, tex, &[sub], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON).unwrap()
                 };
 
-                let scene = make_tex(4, 4, format, D3D12_RESOURCE_FLAG_NONE);
-                let ui = make_tex(8, 8, format, D3D12_RESOURCE_FLAG_NONE);
+                let scene = make_tex(4, 4, scene_format, D3D12_RESOURCE_FLAG_NONE);
+                let ui = make_tex(8, 8, ui_format, D3D12_RESOURCE_FLAG_NONE);
                 let out = make_tex(8, 8, target_format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
                 let _up0 = upload_tex(&scene, &|_, _| scene_color);
                 let _up1 = upload_tex(&ui, &|x, y| {
@@ -1791,9 +1797,9 @@ mod frame_dump_tests {
                     (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
                     (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
                 ];
-                assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
+                assert!(comp.record(&dev, &list, &out, 8, 8, output_format, &planes, 0));
                 list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                let out_desc = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..out.GetDesc() };
+                let out_desc = D3D12_RESOURCE_DESC { Format: output_format, ..out.GetDesc() };
                 let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
                 list.Close().unwrap();
 
@@ -1811,11 +1817,11 @@ mod frame_dump_tests {
                 let (transparent, opaque, blend) = (px(1, 1), px(6, 1), px(1, 2));
                 rb.Unmap(0, None);
 
-                assert_eq!(transparent, scene_color, "transparent overlay in {format:?}");
-                assert_eq!(opaque, [255, 0, 0, 255], "opaque overlay in {format:?}");
+                assert_eq!(transparent, scene_color, "transparent overlay with {scene_format:?} scene and {ui_format:?} UI");
+                assert_eq!(opaque, [255, 0, 0, 255], "opaque overlay with {scene_format:?} scene and {ui_format:?} UI");
                 assert!(
                     blend[..3].iter().zip(expected_blend).all(|(&actual, expected)| actual.abs_diff(expected) <= 2) && blend[3] == expected_blend[3],
-                    "fractional overlay in {format:?}: expected {expected_blend:?}, got {blend:?}",
+                    "fractional overlay with {scene_format:?} scene and {ui_format:?} UI: expected {expected_blend:?}, got {blend:?}",
                 );
             }
         }
