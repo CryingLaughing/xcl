@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::xasync::*;
-use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
+use crate::util::{from_cstr_ptr, hresult_from_win32, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 
 /// Prefix for atomic-write temporary files placed alongside blobs/display files.
 /// `enc()` always percent-encodes `~` as `%7E`, so no encoded blob name can ever start with this.
@@ -267,17 +267,18 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
 // A queued delete must not remove a container partway through a blob update.
 static SAVE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn delete_container(dir: &Path) {
+fn delete_container(dir: &Path) -> Result<(), HRESULT> {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_dir_all(dir);
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.raw_os_error().map_or(E_FAIL, |code| hresult_from_win32(code as u32))),
+    }
 }
 
 pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *const u8) -> HRESULT {
-    match delete_path(p, name) {
-        Ok(dir) => {
-            delete_container(&dir);
-            S_OK
-        }
+    match delete_path(p, name).and_then(|dir| delete_container(&dir)) {
+        Ok(()) => S_OK,
         Err(hr) => hr,
     }
 }
@@ -290,7 +291,7 @@ pub unsafe extern "system" fn XGameSaveDeleteContainerAsync(p: *mut Provider, na
     }
     let dir = delete_path(p, name);
     begin_with(b, &DELETE_ID as *const u8 as usize, move || {
-        delete_container(&dir?);
+        delete_container(&dir?)?;
         Ok(Vec::new())
     })
 }
@@ -698,6 +699,43 @@ mod tests {
         }
         assert!(!fixture.container_dir().exists());
         assert!(fixture.root.is_dir());
+    }
+
+    #[test]
+    fn delete_container_reports_sharing_failure_and_can_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = DeleteFixture::new();
+        let name = CString::new(DELETE_TEST_NAME).unwrap();
+        let blob = fixture.blob_path();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&blob).unwrap();
+        let delete_async = |fixture: &mut DeleteFixture| unsafe {
+            let queue = fixture.block.queue;
+            let block = &mut *fixture.block;
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), block), S_OK);
+            assert_eq!(XGameSaveDeleteContainerResult(block), E_PENDING);
+            assert!(XTaskQueueDispatch(queue, PORT_WORK, 0));
+            XGameSaveDeleteContainerResult(block)
+        };
+
+        let sync_status = unsafe { XGameSaveDeleteContainer(fixture.provider, name.as_ptr().cast()) };
+        assert_eq!(std::fs::read(&blob).unwrap(), b"synthetic save");
+        let async_status = delete_async(&mut fixture);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"synthetic save");
+        drop(held);
+
+        assert_eq!(delete_async(&mut fixture), S_OK, "retry after release");
+        assert!(!fixture.container_dir().exists());
+        assert_eq!(unsafe { XGameSaveDeleteContainer(fixture.provider, name.as_ptr().cast()) }, S_OK, "already absent");
+        assert_eq!(delete_async(&mut fixture), S_OK, "already absent asynchronously");
+
+        const SHARING_VIOLATION: HRESULT = 0x8007_0020u32 as i32; // HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)
+        assert_eq!(
+            (sync_status, async_status), (SHARING_VIOLATION, SHARING_VIOLATION),
+            "locked blob: synchronous HRESULT {sync_status:#010x}, asynchronous HRESULT {async_status:#010x}",
+        );
     }
 
     #[test]
