@@ -268,6 +268,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
+  `XCL_CHAIN_WHOLE_DEMAND_FILE` names a new local JSON Lines file for recording first uses of
+  the whole pipeline built with the dispatch-chain root signature. Use a fresh path per run.
+  Each row gives the fallback reason, present count, and pipeline identity for selecting
+  which whole forms to prewarm. The capture contains hashes and settings only.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so

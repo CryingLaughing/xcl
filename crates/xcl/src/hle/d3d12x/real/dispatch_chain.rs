@@ -4,6 +4,9 @@ use super::*;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
 use std::sync::{Arc, LazyLock, OnceLock};
 
+mod whole_demand;
+use whole_demand::{ChainDemand, Reason};
+
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
@@ -55,10 +58,14 @@ struct Chain {
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    demand: Option<ChainDemand>,
 }
 
 impl Chain {
-    unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
+    unsafe fn whole(&self, reason: Reason) -> Result<ID3D12PipelineState, String> {
+        if let Some(demand) = &self.demand {
+            demand.note(self.builder.record, &self.whole_code, self.builder.flags.0, self.builder.node, reason);
+        }
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
@@ -90,8 +97,12 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         .map(|p| (p != 0).then(|| ID3D12PipelineState::from_raw(p as *mut c_void))).collect();
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
+    let demand = ChainDemand::enabled().then(|| {
+        let luid = dev.GetAdapterLuid();
+        ChainDemand::new(samplers, (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart))
+    });
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), demand });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -106,7 +117,7 @@ pub(super) fn forget(pso: usize) {
 
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+    chain.map(|c| c.whole(Reason::ExecuteIndirect)).transpose()
 }
 
 struct Scratch {
@@ -215,12 +226,19 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let group = u64::from(chain.words) * 4;
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);
-    let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+    let fallback = if allocator == 0 {
+        Some(Reason::MissingAllocator)
+    } else if list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        Some(Reason::Bundle)
+    } else {
+        None
+    };
+    let scratch = fallback.is_none()
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        list.SetPipelineState(&chain.whole(fallback.unwrap_or(Reason::ScratchUnavailable))?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
