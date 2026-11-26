@@ -41,7 +41,7 @@ fn xbox_shader_with_osg(kind: u32, fssms: &[Vec<u8>], osg: &[u8]) -> Vec<u8> {
     let base = xbox_shader(kind, fssms);
     let dxil = xcl::gpu::shader::container_parts(&base).unwrap().into_iter().find(|p| p.fourcc == "DXIL").unwrap();
     let dxil_bytes = &base[dxil.offset..dxil.offset + dxil.size];
-    dxbc_container(&[(b"SFI0", &[0; 8]), (b"OSG1", osg), (b"HASH", &[0; 20]), (b"DXIL", dxil_bytes), (b"PRIV", &[7; 16])])
+    container(&[(b"SFI0", &[0; 8]), (b"OSG1", osg), (b"HASH", &[0; 20]), (b"DXIL", dxil_bytes), (b"PRIV", &[7; 16])])
 }
 
 fn rpf9_record(name: &str, payload: &[u8], usize_override: Option<u32>) -> Vec<u8> {
