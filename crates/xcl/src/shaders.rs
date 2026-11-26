@@ -1708,20 +1708,26 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 };
-                let Some(sh) = xbox::parse(&blob) else {
-                    if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
-                        failed.fetch_add(1, Ordering::Relaxed);
+                let shader = xbox::parse(&blob);
+                let stage = match &shader {
+                    Some(sh) => sh.stage.as_str(),
+                    None if recomp::pso::fspx(&blob).is_some() => "CS",
+                    None => {
+                        if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        record_done();
+                        continue;
                     }
-                    record_done();
-                    continue;
                 };
-                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                if only.is_some_and(|o| !stage.eq_ignore_ascii_case(o)) {
                     record_done();
                     continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
-                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                // An admitted shader without XDAT is the FSPX compute case above.
+                if shader.as_ref().is_none_or(|sh| sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, sh, f), Some(recomp::Mode::Compute(_))))) {
                     if used.is_some_and(|u| !used_compute(&blob, u)) {
                         unused.fetch_add(1, Ordering::Relaxed);
                         record_done();
@@ -1748,6 +1754,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
+                let Some(sh) = shader else { continue };
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {

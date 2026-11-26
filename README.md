@@ -230,6 +230,8 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+`xcl shaders <folder> --precompile --only cs` also accepts ACCC/FSPX compute containers.
+
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
