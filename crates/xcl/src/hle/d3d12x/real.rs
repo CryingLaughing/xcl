@@ -4404,6 +4404,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+pub(crate) use dispatch_chain::whole_demand as chain_whole_demand;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ComputeBuild {
@@ -4413,6 +4414,8 @@ enum ComputeBuild {
     CachedWhole,
     // The chain root signature has a separate on-disk namespace.
     Chain,
+    // Only an actual whole fallback can try its selectively warmed blob.
+    PrewarmedChainWhole { root_signature: u64, adapter: u64 },
 }
 
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
@@ -4426,10 +4429,22 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let chained = matches!(mode, ComputeBuild::Chain | ComputeBuild::PrewarmedChainWhole { .. });
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, chained);
+    let prewarmed = match mode {
+        ComputeBuild::PrewarmedChainWhole { root_signature, adapter } => {
+            driver_cache::chain_whole_path(crate::gpu::shader::fnv64(dxil), dxil.len(), copy.Flags.0, root_signature, adapter)
+        }
+        _ => None,
+    };
+    let mut loaded_path = None;
     let from_disk = cached.is_none();
     if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        cached = [prewarmed.as_deref(), disk.as_deref()].into_iter().flatten().find_map(|path| {
+            let blob = driver_cache::load(path)?;
+            loaded_path = Some(path);
+            Some(std::sync::Arc::new(blob))
+        });
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
@@ -4448,7 +4463,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         // a blob the driver does not take (another root signature at the same address…): compiled
         forget_compute_blob(key);
         if from_disk {
-            driver_cache::note(false, disk.as_deref());
+            driver_cache::note(false, loaded_path);
         }
         if mode == ComputeBuild::CachedWhole {
             return (hr, in_driver, false);
@@ -4472,6 +4487,9 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
+        if let Some(path) = prewarmed.as_deref().filter(|p| Some(*p) == loaded_path) {
+            crate::xlog_info!("D3D12.X: supplied prewarmed chain whole {} for record {record:016x}", path.display());
+        }
     }
     (hr, in_driver, reused)
 }
@@ -4524,6 +4542,13 @@ pub(crate) mod driver_cache {
 
     pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
+    }
+
+    /// Selective replay admits only node mask zero and keeps its blobs separate from both ordinary
+    /// compute and chain-piece blobs. Include the exact root recipe and the selected adapter.
+    pub(crate) fn chain_whole_path(hash: u64, bytes: usize, flags: i32, root: u64, adapter: u64) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(
+            format!("chain-whole-v1-{hash:016x}-{bytes:x}-{flags:x}-{root:016x}-{adapter:016x}.pso")))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {

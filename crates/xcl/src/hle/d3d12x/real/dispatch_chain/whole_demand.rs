@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const SCHEMA: &str = "xcl-chain-whole-demand-v1";
+pub(crate) const SCHEMA: &str = "xcl-chain-whole-demand-v1";
+pub(crate) const SOURCE_ID: &str = env!("XCL_DIRECT_DXIL_SOURCE_ID");
 const CHAIN_ABI: &[u8] = b"dispatch-chain-abi-v1";
 const MAX_RECORDS: usize = 65_536;
 
@@ -51,13 +52,23 @@ struct Identity {
     adapter_luid: u64,
 }
 
-fn sampler_identity(samplers: &[StaticSampler]) -> u64 {
+pub(crate) fn sampler_identity(samplers: &[StaticSampler]) -> u64 {
     let mut input = CHAIN_ABI.to_vec();
     for (words, comparison) in samplers {
         input.extend(words.iter().flat_map(|word| word.to_le_bytes()));
         input.push(*comparison as u8);
     }
     fnv64(&input)
+}
+
+pub(crate) fn adapter_identity(luid: windows::Win32::Foundation::LUID) -> u64 {
+    (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart)
+}
+
+pub(crate) fn options() -> std::collections::BTreeMap<String, String> {
+    ["XCL_DIRECT_DXIL", "XCL_HEAP_WINDOWS", "XCL_PER_LANE", "XCL_DXIL_NO_OPT"]
+        .into_iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_owned(), value)))
+        .collect()
 }
 
 /// Per-object gate: on the normal path this is absent, and a captured chain pays for hashing its
@@ -114,15 +125,12 @@ impl<W: Write> Capture<W> {
     }
 
     fn write_header(&mut self) -> io::Result<()> {
-        let options = ["XCL_DIRECT_DXIL", "XCL_HEAP_WINDOWS", "XCL_PER_LANE", "XCL_DXIL_NO_OPT"]
-            .into_iter().filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
-            .collect::<std::collections::BTreeMap<_, _>>();
         self.row(serde_json::json!({
             "schema": SCHEMA,
             "start_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|t| t.as_millis() as u64),
             "xcl_version": env!("CARGO_PKG_VERSION"),
-            "direct_dxil_source": env!("XCL_DIRECT_DXIL_SOURCE_ID"),
-            "options": options,
+            "direct_dxil_source": SOURCE_ID,
+            "options": options(),
         }))
     }
 

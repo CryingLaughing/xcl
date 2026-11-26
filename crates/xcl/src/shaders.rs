@@ -13,6 +13,8 @@ use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 
+mod chain_whole_replay;
+
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
 #[derive(Default)]
@@ -815,6 +817,8 @@ struct ShadersOptions {
     only: Option<String>,
     pipelines: bool,
     used_only: bool,
+    prewarm_chain_whole: Option<PathBuf>,
+    chain_through: Option<usize>,
     direct: bool,
     sample: usize,
     seed: u64,
@@ -850,6 +854,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         only: None,
         pipelines: false,
         used_only: false,
+        prewarm_chain_whole: None,
+        chain_through: None,
         direct: false,
         sample: 200,
         seed: 1,
@@ -888,6 +894,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--only" => opts.only = Some(p.value("--only")?.to_ascii_lowercase()),
             "--pipelines" => opts.pipelines = true,
             "--used-only" => opts.used_only = true,
+            "--prewarm-chain-whole" => opts.prewarm_chain_whole = Some(PathBuf::from(p.value("--prewarm-chain-whole")?)),
+            "--chain-through" => opts.chain_through = Some(p.parse_usize("--chain-through")?),
             "--direct" => opts.direct = true,
             "--sample" => opts.sample = p.parse_usize("--sample")?,
             "--seed" => opts.seed = p.parse_u64("--seed")?,
@@ -902,6 +910,16 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
+    }
+    if opts.chain_through.is_some() && opts.prewarm_chain_whole.is_none() {
+        return Err("--chain-through requires --prewarm-chain-whole".into());
+    }
+    if opts.chain_through == Some(0) {
+        return Err("--chain-through must select at least one demand".into());
+    }
+    if opts.prewarm_chain_whole.is_some() && (opts.precompile || opts.pipelines || opts.used_only
+        || opts.direct || opts.export_hlsl.is_some() || opts.measure_pso.is_some()) {
+        return Err("--prewarm-chain-whole is a separate operation from precompiling, measuring or exporting shaders".into());
     }
     Ok(opts)
 }
@@ -947,7 +965,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() || opts.prewarm_chain_whole.is_some() {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -975,6 +993,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             runtime_windows(),
             opts.split,
         );
+    }
+    if let Some(capture) = &opts.prewarm_chain_whole {
+        return chain_whole_replay::run(&input, capture, opts.chain_through, runtime_windows(), opts.split);
     }
     if opts.precompile {
         // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
@@ -1223,6 +1244,15 @@ struct Pipelines {
     cache_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipelineOutcome {
+    Reused,
+    Stored,
+    BuiltWithoutBlob,
+    Capped,
+    Refused,
+}
+
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
 /// cap). Above it sit the programs whose driver compile takes tens of minutes and gigabytes —
 /// the > 8 MB HLSL programs DXC compiles at `-O0` (#1269) — and they hang the pass.
@@ -1456,7 +1486,7 @@ impl Pipelines {
                 let workers = chain.pieces.len().min(self.most);
                 if workers <= 1 {
                     for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                        self.make_one(piece, &c.samplers, true, 0, None);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
@@ -1465,7 +1495,7 @@ impl Pipelines {
                             s.spawn(|| loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                self.make_one(piece, &c.samplers, true, 0, None);
                             });
                         }
                     });
@@ -1473,10 +1503,11 @@ impl Pipelines {
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, false, 0, path_override);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, flags: i32,
+        path_override: Option<PathBuf>) -> PipelineOutcome {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
@@ -1496,7 +1527,7 @@ impl Pipelines {
                         }
                         Err(_) => {
                             self.refused.fetch_add(1, Ordering::Relaxed);
-                            return;
+                            return PipelineOutcome::Refused;
                         }
                     }
                 }
@@ -1505,6 +1536,7 @@ impl Pipelines {
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+            Flags: D3D12_PIPELINE_STATE_FLAGS(flags),
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
@@ -1524,7 +1556,7 @@ impl Pipelines {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return;
+            return PipelineOutcome::Capped;
         }
         {
             let mut n = self.running.0.lock().unwrap();
@@ -1552,35 +1584,40 @@ impl Pipelines {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return;
+            return PipelineOutcome::Capped;
         }
-        let r = if let Some(pso) = from_cache {
+        let outcome = if from_cache.is_some() {
             self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
+            PipelineOutcome::Reused
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            let mut stored = false;
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                     let len = unsafe { blob.GetBufferSize() };
                     if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+                        stored = driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
                     }
                 }
             }
-            pso
+            if pso.is_err() { PipelineOutcome::Refused }
+            else if stored { PipelineOutcome::Stored }
+            else { PipelineOutcome::BuiltWithoutBlob }
         };
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+        let done = if outcome == PipelineOutcome::Refused {
+            self.refused.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.made.fetch_add(1, Ordering::Relaxed) + 1
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
+        outcome
     }
 }
 

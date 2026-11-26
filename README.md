@@ -224,6 +224,7 @@ xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console contain
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
+xcl shaders D:\data\shaders.rpf --prewarm-chain-whole demand.jsonl --chain-through 20   # first 20 requested chain whole forms
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
@@ -272,6 +273,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   the whole pipeline built with the dispatch-chain root signature. Use a fresh path per run.
   Each row gives the fallback reason, present count, and pipeline identity for selecting
   which whole forms to prewarm. The capture contains hashes and settings only.
+  `--prewarm-chain-whole` reads that capture and builds its selected forms in request order.
+  `--chain-through N` requires all requests through sequence N to be present. Use the same
+  translation options and adapter as the capture, including the `--windows` and `--split`
+  settings. Missing records, mismatched identities, nonzero node masks, and forms over the
+  pipeline size cap are reported as incomplete. Enable `XCL_CHAIN_WHOLE_REPLAY=1` in the title
+  run to use these blobs. They live in a separate cache namespace from ordinary compute and the
+  individual split pieces.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so

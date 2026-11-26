@@ -4,8 +4,12 @@ use super::*;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
 use std::sync::{Arc, LazyLock, OnceLock};
 
-mod whole_demand;
+pub(crate) mod whole_demand;
 use whole_demand::{ChainDemand, Reason};
+
+static REPLAY_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("XCL_CHAIN_WHOLE_REPLAY").is_ok_and(|value| value == "1")
+});
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
@@ -42,11 +46,11 @@ struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID, mode: ComputeBuild) -> Option<ID3D12PipelineState> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
+            dxil, self.record, iid, &mut raw, mode);
         (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
     }
 }
@@ -59,6 +63,7 @@ struct Chain {
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
     demand: Option<ChainDemand>,
+    whole_mode: ComputeBuild,
 }
 
 impl Chain {
@@ -69,7 +74,8 @@ impl Chain {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
+        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState), self.whole_mode)
+            .ok_or("whole compute pipeline")?;
         let _ = self.whole.set(p.clone());
         Ok(p)
     }
@@ -90,7 +96,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         let plan = plan.clone();
         let builder = builder.clone();
         let iid = if i == 0 { *iid } else { pc_iid(Kind::PipelineState) };
-        Box::new(move || builder.pipeline(&plan.pieces[i], &iid).map_or(0, |p| p.into_raw() as usize)) as super::super::pso_async::Job
+        Box::new(move || builder.pipeline(&plan.pieces[i], &iid, ComputeBuild::Chain)
+            .map_or(0, |p| p.into_raw() as usize)) as super::super::pso_async::Job
     }).collect();
     // Take ownership of every success, including when a different piece failed.
     let built: Vec<_> = super::super::pso_async::build_pieces(jobs).into_iter()
@@ -98,11 +105,18 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let demand = ChainDemand::enabled().then(|| {
-        let luid = dev.GetAdapterLuid();
-        ChainDemand::new(samplers, (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart))
+        ChainDemand::new(samplers, whole_demand::adapter_identity(dev.GetAdapterLuid()))
     });
+    let whole_mode = if *REPLAY_ENABLED && desc.NodeMask == 0 {
+        ComputeBuild::PrewarmedChainWhole {
+            root_signature: whole_demand::sampler_identity(samplers),
+            adapter: whole_demand::adapter_identity(dev.GetAdapterLuid()),
+        }
+    } else {
+        ComputeBuild::Chain
+    };
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), demand });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), demand, whole_mode });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
