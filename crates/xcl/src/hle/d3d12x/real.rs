@@ -627,8 +627,37 @@ unsafe fn vt(obj: *mut c_void) -> *const usize {
     *(obj as *const *const usize)
 }
 
-/// Original function of `slot` for an adopted object.
+#[cfg(test)]
+thread_local! {
+    static TEST_ORIG_FN: std::cell::RefCell<Vec<(usize, usize, usize)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Override one native method on one object for the duration of a synthetic test.
+#[cfg(test)]
+pub(super) fn with_test_orig_fn<T>(object: *mut c_void, slot: usize, method: usize, run: impl FnOnce() -> T) -> T {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEST_ORIG_FN.with(|overrides| { let _ = overrides.borrow_mut().pop(); });
+        }
+    }
+    TEST_ORIG_FN.with(|overrides| overrides.borrow_mut().push((object as usize, slot, method)));
+    let _guard = Guard;
+    run()
+}
+
+/// Original native method of an adopted object.
 pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
+    #[cfg(test)]
+    if let Some(method) = TEST_ORIG_FN.with(|overrides| {
+        overrides.borrow().iter().rev()
+            .find(|&&(object, index, _)| object == this as usize && index == slot)
+            .map(|&(_, _, method)| method)
+    }) {
+        return method;
+    }
     let ext = vt(this);
     let orig = *ext.sub(1) as *const usize;
     *orig.add(slot)

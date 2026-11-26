@@ -4594,6 +4594,187 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn kickoff_close_refusal_preserves_identity_and_recovers_a_native_recording() {
+        use std::cell::Cell;
+        use windows::core::IUnknown;
+
+        type Execute = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+        #[derive(Clone, Copy, Default)]
+        struct SubmitProbe {
+            calls: u32,
+            forwarded: u32,
+            expected_list: usize,
+            native_execute: usize,
+        }
+        thread_local! {
+            static REFUSALS: Cell<u32> = const { Cell::new(0) };
+            static SUBMITS: Cell<SubmitProbe> = Cell::new(SubmitProbe::default());
+        }
+
+        unsafe extern "system" fn refuse_close(_: *mut c_void) -> i32 {
+            REFUSALS.with(|calls| calls.set(calls.get() + 1));
+            crate::util::E_OUTOFMEMORY
+        }
+
+        unsafe extern "system" fn observe_execute(queue: *mut c_void, count: u32, lists: *const *mut c_void) {
+            let mut forward = None;
+            SUBMITS.with(|probe| {
+                let mut observed = probe.get();
+                observed.calls += 1;
+                if observed.expected_list != 0 && count == 1 && !lists.is_null()
+                    && *lists as usize == observed.expected_list
+                {
+                    observed.forwarded += 1;
+                    forward = Some(observed.native_execute);
+                }
+                probe.set(observed);
+            });
+            if let Some(native) = forward {
+                let execute: Execute = std::mem::transmute(native);
+                execute(queue, count, lists);
+            }
+        }
+
+        fn effects(list: *mut c_void) -> (usize, usize, usize) {
+            LISTS.lock().unwrap().as_ref().and_then(|map| map.get(&(list as usize)))
+                .map_or((0, 0, 0), |state| (state.pending_waits.len(), state.write64_signals.len(), state.cpu_writes.len()))
+        }
+
+        unsafe fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 16,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut resource = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource,
+            ).unwrap();
+            resource.unwrap()
+        }
+
+        if super::super::backend() != super::super::Backend::Real {
+            return crate::gpu::recomp::runner::skip_test("no real D3D12 backend");
+        }
+        unsafe {
+            let raw_device = real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).expect("real backend device");
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let queue_raw = queue.as_raw();
+            real::adopt(queue_raw, real::Kind::CommandQueue);
+            on_queue_create(queue_raw as usize, raw_device as usize, ty);
+            let producer_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let healthy_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let producer = real::create_raw_pc_command_list(raw_device, ty, producer_alloc.as_raw() as usize, 0)
+                .expect("adopted producer command list");
+            on_create(producer, producer_alloc.as_raw() as usize, 0, ty);
+            let wrapper_raw = super::super::title_list::wrap(producer);
+            let wrapper = IUnknown::from_raw(wrapper_raw);
+            let list = wrapper.cast::<ID3D12GraphicsCommandList>().expect("wrapper graphics list");
+            let command_list = wrapper.cast::<ID3D12CommandList>().expect("wrapper command list");
+            assert_eq!(list.as_raw(), wrapper_raw);
+            assert_eq!(command_list.as_raw(), wrapper_raw);
+            assert_eq!(super::super::title_list::backing(wrapper_raw), Some(producer));
+            // The driver can return a distinct canonical IUnknown for the primary list.
+            let original_identity = list.cast::<IUnknown>().expect("original COM identity");
+            println!("kickoff identity: IUnknown aliases wrapper={}", original_identity.as_raw() == wrapper_raw);
+
+            // This private naturally aligned address is never submitted to the driver.
+            static CPU_SENTINEL: AtomicU64 = AtomicU64::new(0);
+            CPU_SENTINEL.store(0, Ordering::Release);
+            let va = (&CPU_SENTINEL as *const AtomicU64) as u64;
+            {
+                let mut lists = LISTS.lock().unwrap();
+                let state = lists.as_mut().unwrap().get_mut(&(producer as usize)).unwrap();
+                state.last_queue = Some(queue_raw as usize);
+                state.push_wait(PendingWait { va, width: 8, comparison: 3, value: 0, mask: u64::MAX, after_write64: false });
+                state.push_write64_signal(va, 1);
+                state.cpu_writes.push(super::super::cpu_writes::Write::Immediate(va as usize, vec![1]));
+            }
+
+            REFUSALS.with(|calls| calls.set(0));
+            SUBMITS.with(|probe| probe.set(SubmitProbe::default()));
+            real::with_test_orig_fn(queue_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS, observe_execute as usize, || {
+                real::with_test_orig_fn(producer, PC_CLOSE, refuse_close as usize, || {
+                    kickoff_x(producer);
+                    assert_eq!(REFUSALS.with(Cell::get), 1, "one injected producer Close");
+                    assert_eq!(SUBMITS.with(Cell::get).calls, 0, "refusal must happen before queue submission");
+                    let mut segments = Vec::new();
+                    assert!(super::super::title_list::push_segments(wrapper_raw, &mut segments));
+                    let retained = effects(producer);
+                    println!("kickoff refusal: retained={retained:?} eligible_segments={}", segments.len());
+                    // The control fails here, before it can send the old recording to the runtime.
+                    assert_eq!((retained, segments.len()), ((1, 1, 1), 0), "failed recording is retained and hidden");
+                    assert_eq!(list.Close().unwrap_err().code().0, crate::util::E_OUTOFMEMORY);
+                    assert_eq!(REFUSALS.with(Cell::get), 1, "wrapper Close must not call the refused producer again");
+                });
+
+                queue.ExecuteCommandLists(&[Some(command_list.clone())]);
+                assert_eq!(SUBMITS.with(Cell::get).calls, 0, "hidden wrapper must omit even an empty native Execute");
+                assert_eq!(effects(producer), (1, 1, 1));
+                assert_eq!(CPU_SENTINEL.load(Ordering::Acquire), 0);
+                assert_eq!(super::super::title_list::backing(wrapper_raw), Some(producer));
+            });
+
+            list.Reset(&healthy_alloc, None).expect("explicit title Reset recovers on a different allocator");
+            assert_eq!(effects(producer), (0, 0, 0), "failed effects are discarded at successful Reset");
+            assert_eq!(super::super::title_list::backing(wrapper_raw), Some(producer));
+            let identity = list.cast::<IUnknown>().expect("recovered COM identity");
+            assert_eq!(identity.as_raw(), original_identity.as_raw());
+            assert_eq!(list.cast::<ID3D12CommandList>().unwrap().as_raw(), wrapper_raw);
+            let mut recovered = Vec::new();
+            assert!(super::super::title_list::push_segments(wrapper_raw, &mut recovered));
+            assert_eq!(recovered.len(), 1);
+            assert_ne!(recovered[0], producer, "the identity list remains permanently unresettable");
+
+            let expected = [0x1357_9bdfu32, 0x2468_ace0, 0x0246_8ace, 0xfdb9_7531];
+            let upload = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let readback = buffer(dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            let mut mapped = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut mapped)).unwrap();
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), mapped.cast::<u32>(), expected.len());
+            upload.Unmap(0, None);
+            list.CopyBufferRegion(&readback, 0, &upload, 0, 16);
+            list.Close().expect("healthy backing closes");
+
+            let native_execute = real::orig_fn(queue_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS);
+            SUBMITS.with(|probe| probe.set(SubmitProbe {
+                expected_list: recovered[0] as usize, native_execute, ..Default::default()
+            }));
+            real::with_test_orig_fn(queue_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS, observe_execute as usize, || {
+                queue.ExecuteCommandLists(&[Some(command_list.clone())]);
+            });
+            let submit = SUBMITS.with(Cell::get);
+            assert_eq!((submit.calls, submit.forwarded), (1, 1), "submit exactly the recovered backing");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, dev, None, 5000).expect("healthy recording reaches its fence");
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let actual = [*mapped.cast::<u32>(), *mapped.cast::<u32>().add(1),
+                *mapped.cast::<u32>().add(2), *mapped.cast::<u32>().add(3)];
+            readback.Unmap(0, None);
+            assert_eq!(actual, expected);
+            assert_eq!(CPU_SENTINEL.load(Ordering::Acquire), 0, "old CPU write did not run");
+
+            list.Reset(&healthy_alloc, None).expect("a later title Reset must still avoid the refused primary");
+            let mut later = Vec::new();
+            assert!(super::super::title_list::push_segments(wrapper_raw, &mut later));
+            assert_eq!(later.len(), 1);
+            assert_ne!(later[0], producer);
+            assert_eq!(super::super::title_list::backing(wrapper_raw), Some(producer));
+            list.Close().unwrap();
+            println!("kickoff recovery: native submits=1, readback={actual:08x?}, old CPU write=0, identity preserved");
+        }
+    }
+
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
     /// and is gone from it once the fence gets there.
     #[test]
