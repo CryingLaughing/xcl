@@ -414,6 +414,8 @@ fn buffer_format_d16(name: &str) -> Option<(BufKind, u64, bool)> {
     Some((kind, components, high))
 }
 
+pub(crate) const BUF_FORMAT_32_32_UINT: u32 = 62;
+
 /// GFX10 unified buffer formats (index = FORMAT value; LLVM `UfmtSymbolicGFX10`).
 pub const BUF_FORMATS: [&str; 78] = [
     "INVALID", "8_UNORM", "8_SNORM", "8_USCALED", "8_SSCALED", "8_UINT", "8_SINT", "16_UNORM", "16_SNORM", "16_USCALED",
@@ -2254,7 +2256,22 @@ impl Em {
                     return Ok(());
                 }
                 let vals: Vec<String> = (0..4).map(|i| if i < count { self.vreg(vdata + i) } else { "0u".into() }).collect();
-                self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
+                let mut packed_input = format!("uint4({})", vals.join(", "));
+                if d.enc.name == "ENC_MUBUF" && name == "buffer_store_format_xyzw" {
+                    // Match the direct lowerer's 32_32_UINT pair routing before packing.
+                    self.line(&format!("uint4 {t}_data = {packed_input};"));
+                    self.line(&format!("uint3 {t}_sels = uint3({d3}, {d3} >> 3u, {d3} >> 6u) & 7u;"));
+                    self.line(&format!("bool {t}_y_chan = {t}_sels.y >= 4u, {t}_z_chan = {t}_sels.z >= 4u;"));
+                    self.line(&format!("bool {t}_route = and({fmt} == {BUF_FORMAT_32_32_UINT}u, all(({t}_sels & 6u) != 2u));"));
+                    self.line(&format!("uint {t}_second = select(and({t}_y_chan, !{t}_z_chan), {t}_data.y, {t}_data.w);"));
+                    self.line(&format!("bool {t}_reverse = and({t}_sels.x != 4u, or({t}_y_chan, {t}_z_chan));"));
+                    self.line(&format!("uint {t}_first = select({t}_reverse, {t}_second, {t}_data.x);"));
+                    self.line(&format!("uint {t}_last = select({t}_reverse, {t}_data.x, {t}_second);"));
+                    self.line(&format!("{t}_data.x = select({t}_route, {t}_first, {t}_data.x);"));
+                    self.line(&format!("{t}_data.y = select({t}_route, {t}_last, {t}_data.y);"));
+                    packed_input = format!("{t}_data");
+                }
+                self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack({packed_input}, {t}_info), fmt_bytes({t}_info));"));
             }
         }
         Ok(())

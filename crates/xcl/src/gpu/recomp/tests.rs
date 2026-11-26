@@ -1809,6 +1809,68 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn gpu_mubuf_u32x2_xyzw_store_selects_channels() {
+    use super::emit::BUF_FORMAT_32_32_UINT;
+
+    const GUARD: u32 = 0xface_cafe;
+    let [x, y, z, w] = [0x11, 0x22, 0x33, 0x44];
+    let xy = [x, y, GUARD, GUARD];
+    let xw = [x, w, GUARD, GUARD];
+    let format = BUF_FORMAT_32_32_UINT;
+    // The channel pairs are expectations from the gfx1036 hardware measurements. Reserved
+    // selectors and neighboring opcodes/formats check that this routing stays narrowly scoped.
+    let cases = [
+        ("XY01", format, [4, 5, 0, 1], false, 32, xy),
+        ("XYZW", format, [4, 5, 6, 7], false, 32, xw),
+        ("XYZ1", format, [4, 5, 6, 1], false, 32, xw),
+        ("YX01", format, [5, 4, 0, 1], false, 32, [y, x, GUARD, GUARD]),
+        ("YZZ1", format, [5, 6, 6, 1], false, 32, [w, x, GUARD, GUARD]),
+        ("Y001", format, [5, 0, 0, 1], false, 32, xw),
+        ("reserved X", format, [2, 5, 6, 1], false, 32, xy),
+        ("reserved Y", format, [4, 3, 6, 1], false, 32, xy),
+        ("reserved Z", format, [5, 4, 2, 1], false, 32, xy),
+        ("MTBUF", format, [4, 5, 6, 7], true, 32, xy),
+        ("32_32_SINT", 63, [4, 5, 6, 7], false, 32, xy),
+        ("32_32_32_32_UINT", 75, [4, 5, 6, 7], false, 32, [x, y, z, w]),
+        ("out of bounds", format, [4, 5, 6, 7], false, 4, [GUARD; 4]),
+    ];
+    let mut code = Vec::new();
+    let mut st = KernelState::default();
+    // One active lane and disjoint output slots avoid races between stores.
+    st.sgpr[126] = 1;
+    st.sgpr[127] = 0;
+    st.vgpr[0][4..8].copy_from_slice(&[x, y, z, w]);
+    for (i, &(_, format, selectors, typed, size, _)) in cases.iter().enumerate() {
+        let srsrc = 2 + i;
+        let selectors = selectors.into_iter().enumerate().fold(0, |bits, (j, sel)| bits | (sel << (3 * j)));
+        let base = (8 * i + 2) as u32 * 4;
+        st.sgpr[srsrc * 4..srsrc * 4 + 4].copy_from_slice(&[base, 0, size, selectors | format << 12]);
+        let mut fields = vec![("VDATA", 4), ("SRSRC", srsrc as u64), ("SOFFSET", 128)];
+        let (name, encoding) = if typed {
+            fields.push(("FORMAT", u64::from(format)));
+            ("TBUFFER_STORE_FORMAT_XYZW", "ENC_MTBUF")
+        } else {
+            ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF")
+        };
+        code.extend(encode(name, encoding, &fields, None).unwrap());
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mem = vec![GUARD; cases.len() * 8];
+    for wave64 in gpu_waves() {
+        let (dxil, _) = kernel_wave(&code, wave64);
+        let actual = runner::run(&dxil, &st, &mem).unwrap();
+        let wave = if wave64 { 64 } else { 32 };
+        let backend = if runner::direct_dxil() { "direct" } else { "hlsl" };
+        for (i, &(case, _, _, _, _, words)) in cases.iter().enumerate() {
+            let mut expected = [GUARD; 8];
+            expected[2..6].copy_from_slice(&words);
+            assert_eq!(actual.mem[8 * i..8 * (i + 1)], expected, "{backend} wave{wave} {case}");
+        }
+        println!("MUBUF_U32X2_STORE backend={backend} wave={wave} rows={} adapter={}", cases.len(), runner::adapter().unwrap());
+    }
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }
