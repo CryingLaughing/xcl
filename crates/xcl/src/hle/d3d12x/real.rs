@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 use windows::core::{Interface, PCSTR};
@@ -2341,40 +2341,80 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+type ViewResourceKey = (u64, [u8; 0x38]);
+
+enum ViewResource {
+    Building(Arc<OnceLock<usize>>),
+    /// The cache keeps the creation reference for the life of the process. Zero caches failure.
+    Ready(usize),
+}
+
+struct ViewResourceCache {
+    entries: Mutex<Option<HashMap<ViewResourceKey, ViewResource>>>,
+    completed: AtomicUsize,
+}
+
+impl ViewResourceCache {
+    const fn new() -> Self {
+        Self { entries: Mutex::new(None), completed: AtomicUsize::new(0) }
+    }
+
+    fn get_or_create(&self, key: ViewResourceKey, create: impl FnOnce() -> usize) -> usize {
+        use std::collections::hash_map::Entry;
+
+        let pending = {
+            let mut guard = self.entries.lock().unwrap();
+            match guard.get_or_insert_with(HashMap::new).entry(key) {
+                Entry::Occupied(entry) => match entry.get() {
+                    ViewResource::Ready(resource) => return *resource,
+                    ViewResource::Building(pending) => Arc::clone(pending),
+                },
+                Entry::Vacant(entry) => {
+                    let pending = Arc::new(OnceLock::new());
+                    entry.insert(ViewResource::Building(Arc::clone(&pending)));
+                    pending
+                }
+            }
+        };
+
+        // Native creation and waiting both run outside the map lock.
+        let resource = *pending.get_or_init(create);
+        let mut guard = self.entries.lock().unwrap();
+        let entry = guard.as_mut().unwrap().get_mut(&key).unwrap();
+        if matches!(entry, ViewResource::Building(_)) {
+            *entry = ViewResource::Ready(resource);
+            self.completed.fetch_add(1, Ordering::Relaxed);
+        }
+        resource
+    }
+}
+
+static VIEW_RESOURCES: ViewResourceCache = ViewResourceCache::new();
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
     let x = view_key((desc as *const [u8; 0x38]).read_unaligned());
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
-        return r as *mut c_void;
-    }
-    let mut r = std::ptr::null_mut();
-    let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
-    if hr < 0 || r.is_null() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 8 {
-            crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
+    VIEW_RESOURCES.get_or_create((va, x), || {
+        let mut r = std::ptr::null_mut();
+        let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
+        if hr < 0 || r.is_null() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
+            }
+            return 0;
         }
-        r = std::ptr::null_mut();
-    }
-    let mut made = MADE.lock().unwrap();
-    let made = made.get_or_insert_with(HashMap::new);
-    made.insert((va, x), r as usize);
-    VIEW_TEXTURES.store(made.len(), Ordering::Relaxed);
-    r
+        r as usize
+    }) as *mut c_void
 }
 
-/// How many textures `resource_at` keeps (`XCL_ACTIVITY`; #2743).
-static VIEW_TEXTURES: AtomicUsize = AtomicUsize::new(0);
-
-/// `XCL_ACTIVITY`: the textures made for views without a resource object, kept for good.
+/// `XCL_ACTIVITY`: completed view-resource cache entries, including cached failures.
 pub fn view_textures() -> usize {
-    VIEW_TEXTURES.load(Ordering::Relaxed)
+    VIEW_RESOURCES.completed.load(Ordering::Relaxed)
 }
 
 /// The part of a view's resource desc that tells its texture: the PC desc without its padding –
@@ -2388,6 +2428,11 @@ fn view_key(mut x: [u8; 0x38]) -> [u8; 0x38] {
 
 #[cfg(test)]
 mod view_key_tests {
+    use super::{Arc, ViewResource, ViewResourceCache, ViewResourceKey};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     /// Descriptions that differ only in their padding are one texture; any other byte keeps
     /// them apart.
     #[test]
@@ -2405,6 +2450,58 @@ mod view_key_tests {
             c[at] ^= 1;
             assert_ne!(super::view_key(a), super::view_key(c), "byte {at:#x}");
         }
+    }
+
+    #[test]
+    fn view_resources_share_a_pending_build_and_cache_zero() {
+        const FIRST: ViewResourceKey = (0x1000, [0; 0x38]);
+        const SECOND: ViewResourceKey = (0x2000, [0; 0x38]);
+        const WAIT: Duration = Duration::from_secs(5);
+        let cache = ViewResourceCache::new();
+        let cache = &cache;
+        std::thread::scope(|scope| {
+            let (started, running) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let first = scope.spawn(move || cache.get_or_create(FIRST, || {
+                started.send(()).unwrap();
+                released.recv_timeout(WAIT * 3).expect("release the first key's factory");
+                17
+            }));
+            running.recv_timeout(WAIT).expect("the first key's factory started");
+            assert_eq!(cache.completed.load(Ordering::Relaxed), 0);
+
+            let same = scope.spawn(|| cache.get_or_create(FIRST, || panic!("same key was built twice")));
+            let (finished, result) = mpsc::channel();
+            scope.spawn(move || {
+                let zero = cache.get_or_create(SECOND, || 0);
+                let reused = cache.get_or_create(SECOND, || panic!("cached zero was rebuilt"));
+                finished.send((zero, reused)).unwrap();
+            });
+            assert_eq!(result.recv_timeout(WAIT).expect("a different key finished with the first one held"), (0, 0));
+            assert_eq!(cache.completed.load(Ordering::Relaxed), 1);
+
+            let deadline = Instant::now() + WAIT;
+            loop {
+                let guard = cache.entries.lock().unwrap();
+                let entry = guard.as_ref().unwrap().get(&FIRST);
+                if matches!(entry, Some(ViewResource::Building(pending)) if Arc::strong_count(pending) >= 3) {
+                    break;
+                }
+                drop(guard);
+                assert!(Instant::now() < deadline, "the same-key caller joined the pending factory");
+                std::thread::yield_now();
+            }
+
+            release.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), 17);
+            assert_eq!(same.join().unwrap(), 17);
+            assert_eq!(cache.completed.load(Ordering::Relaxed), 2);
+            assert_eq!(cache.get_or_create(FIRST, || panic!("completed resource was rebuilt")), 17);
+            let guard = cache.entries.lock().unwrap();
+            let entries = guard.as_ref().unwrap();
+            assert!(matches!(entries.get(&FIRST), Some(ViewResource::Ready(17))));
+            assert!(matches!(entries.get(&SECOND), Some(ViewResource::Ready(0))));
+        });
     }
 }
 
