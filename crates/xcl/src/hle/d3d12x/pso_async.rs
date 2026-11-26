@@ -303,34 +303,79 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
+struct RegularWorkers {
+    sender: mpsc::Sender<Work>,
+    replacement_attempted: bool,
+}
+
+impl RegularWorkers {
+    fn new(sender: mpsc::Sender<Work>) -> Self {
+        Self { sender, replacement_attempted: false }
+    }
+
+    fn send(
+        &mut self,
+        work: Work,
+        start_replacement: impl FnOnce(mpsc::Receiver<Work>) -> bool,
+    ) -> Result<(), mpsc::SendError<Work>> {
+        let Err(rejected) = self.sender.send(work) else { return Ok(()) };
+        if self.replacement_attempted {
+            return Err(rejected);
+        }
+        // Retry rejected work only. A worker that exits after admission is a separate case.
+        // This is one replacement attempt for the pool, even if the OS refuses it.
+        self.replacement_attempted = true;
+        let (sender, receiver) = mpsc::channel();
+        if !start_replacement(receiver) {
+            return Err(rejected);
+        }
+        self.sender = sender;
+        self.sender.send(rejected.0)
+    }
+}
+
+fn start_regular_worker(name: String, rx: Arc<Mutex<mpsc::Receiver<Work>>>) -> bool {
+    // Translation recurses deeply on big programs. DXC itself runs on its own pool.
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(64 << 20)
+        .spawn(move || loop {
+            let next = rx.lock().unwrap().recv();
+            let Ok(work) = next else { return };
+            while let Some(p) = next_needed() {
+                build_queued(&p);
+            }
+            work();
+        })
+        .is_ok()
+}
+
+fn queue() -> &'static Mutex<RegularWorkers> {
+    static Q: OnceLock<Mutex<RegularWorkers>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
-                }
-                work();
-            });
+        for k in 0..crate::gpu::recomp::dxc::compile_threads() {
+            start_regular_worker(format!("xcl-pso-{k}"), rx.clone());
         }
-        Mutex::new(tx)
+        Mutex::new(RegularWorkers::new(tx))
     })
 }
 
+fn send_to_workers(work: Work) -> bool {
+    // Drop a rejected closure after releasing the queue lock.
+    let result = queue().lock().unwrap().send(work, |rx| {
+        start_regular_worker("xcl-pso-replacement".into(), Arc::new(Mutex::new(rx)))
+    });
+    result.is_ok()
+}
+
 fn enqueue(p: &Arc<Pending>) -> bool {
-    enqueue_on(p, |work| queue().lock().unwrap().send(work).is_ok())
+    enqueue_on(p, send_to_workers)
 }
 
 /// Submit once. A concurrent caller can continue its bounded wait while the send is in progress.
-/// A disconnected channel cannot reopen, but an unlimited bind can still take the retained job.
+/// If the regular pool cannot accept it, an unlimited bind can still take the retained job.
 fn enqueue_on(p: &Arc<Pending>, send: impl FnOnce(Work) -> bool) -> bool {
     if let Err(state) = p.regular_queue.compare_exchange(
         RegularQueue::Unsent as u8, RegularQueue::Sending as u8, Ordering::AcqRel, Ordering::Acquire,
@@ -377,7 +422,7 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let parent = BUILDING.with(|b| b.borrow().clone());
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
-        let _ = queue().lock().unwrap().send(Box::new(move || {
+        send_to_workers(Box::new(move || {
             let before = BUILDING.with(|b| b.replace(parent));
             drain();
             BUILDING.with(|b| *b.borrow_mut() = before);
@@ -593,6 +638,46 @@ mod used_tests {
     use super::*;
 
     #[test]
+    fn a_disconnected_regular_queue_reuses_one_replacement_worker() {
+        use std::time::Duration;
+
+        let first = 0x7E57_C353;
+        let second = 0x7E57_C354;
+        let first_real = 0xC353;
+        let second_real = 0xC354;
+        submit_lazy(first, true, Box::new(move || first_real), 0);
+        submit_lazy(second, true, Box::new(move || second_real), 0);
+        let first_pending = entry(first).unwrap();
+        let second_pending = entry(second).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let mut workers = RegularWorkers::new(sender);
+        let mut replacement = None;
+        assert!(enqueue_on(&first_pending, |work| {
+            workers.send(work, |receiver| {
+                replacement = Some(receiver);
+                true
+            }).is_ok()
+        }));
+        assert!(enqueue_on(&second_pending, |work| {
+            workers.send(work, |_| panic!("later work must use the replacement receiver")).is_ok()
+        }));
+        assert!(enqueue_on(&first_pending, |_| panic!("an admitted build must not be sent again")));
+        assert_eq!(resolve_wait_for(first, Some(Duration::ZERO)), first);
+        assert_eq!(resolve_wait_for(second, Some(Duration::ZERO)), second);
+
+        let receiver = replacement.expect("one replacement receiver");
+        receiver.try_recv().expect("the rejected work was retried")();
+        receiver.try_recv().expect("later work used the same receiver")();
+        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(resolve_wait_for(first, Some(Duration::ZERO)), first_real);
+        assert_eq!(resolve_wait_for(second, Some(Duration::ZERO)), second_real);
+        assert_eq!(released(first), first_real);
+        assert_eq!(released(second), second_real);
+    }
+
+    #[test]
     fn a_disconnected_regular_queue_keeps_the_job_for_an_unlimited_bind() {
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
@@ -608,12 +693,21 @@ mod used_tests {
         let pending = entry(standin).unwrap();
         let (sender, receiver) = mpsc::channel();
         drop(receiver);
+        let mut workers = RegularWorkers::new(sender);
+        let mut replacement_attempted = false;
         assert!(!enqueue_on(&pending, |work| {
             // An image-only bind can observe `Sending` before this send returns its error.
             assert_eq!(resolve_spared(&pending, standin), standin);
             assert!(!pending.late.load(Ordering::Acquire), "an in-progress send has not admitted the job");
-            sender.send(work).is_ok()
+            assert_eq!(resolve_wait_for(standin, Some(Duration::ZERO)), standin);
+            assert!(!pending.late.load(Ordering::Acquire), "a bounded bind cannot mark an unadmitted job late");
+            workers.send(work, |_| {
+                replacement_attempted = true;
+                false
+            }).is_ok()
         }));
+        assert!(replacement_attempted, "a rejected send must try one replacement");
+        assert!(workers.send(Box::new(|| {}), |_| panic!("replacement has already failed")).is_err());
         assert!(pending.queue_disconnected());
         assert_eq!(resolve_wait_for(standin, Some(Duration::ZERO)), standin);
         assert!(is_pending(standin), "the retained job can still build inline");
@@ -1181,10 +1275,11 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
-/// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
-/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
-/// dispatches are skipped) until a worker has built it.
+/// Wait for the part of `budget` that remains after admission and preparation. OS scheduling and
+/// worker startup can still add latency. Compilation runs only on a worker. An admitted
+/// pipeline still unfinished at the deadline is `late`, so binds use its stand-in until it is built.
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+    let start = std::time::Instant::now();
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => p.stand(pso),
         r => r,
@@ -1202,11 +1297,16 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     }
     p.want();
     // Completion and disconnection both publish while holding the wait mutex.
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d && !p.queue_disconnected()).unwrap();
+    let done = p.done.lock().unwrap();
+    let remaining = budget.saturating_sub(start.elapsed());
+    let (done, _) = p.cv.wait_timeout_while(done, remaining, |d| !*d && !p.queue_disconnected()).unwrap();
     if *done || p.queue_disconnected() {
         return built(p);
     }
     drop(done);
+    if p.regular_queue.load(Ordering::Acquire) != RegularQueue::Sent as u8 {
+        return built(p);
+    }
     p.late.store(true, Ordering::Release);
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1303,7 +1403,7 @@ pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
         NEEDED.lock().unwrap().push_back(p);
-        let _ = queue().lock().unwrap().send(Box::new(|| ()));
+        send_to_workers(Box::new(|| ()));
     }
 }
 
