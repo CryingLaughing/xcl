@@ -270,6 +270,7 @@ mod translated {
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
+            let id = split_preference_identity(id, Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::prefer_split_chain());
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -277,6 +278,10 @@ mod translated {
                 id
             }
         })
+    }
+
+    fn split_preference_identity(id: u64, preserve: bool) -> u64 {
+        if preserve { identity_for(&id.to_string(), "xcl-direct-preserve-split-chain") } else { id }
     }
 
     /// a second hash of the bytes, independent of `fnv64`'s
@@ -512,6 +517,7 @@ mod translated {
             None => id,
         };
         let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
+        let id = split_preference_identity(id, crate::gpu::dxil::kernel::prefer_split_chain());
         if crate::gpu::recomp::lower_dxil::enabled() {
             identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
         } else {
@@ -1616,13 +1622,15 @@ mod shader_cache_tests {
         if let Ok(case) = std::env::var(RUN) {
             let (marker, expected) = case.split_once(':').unwrap();
             let marker = marker.parse::<u8>().unwrap();
+            let expected = expected.parse::<u8>().unwrap();
             let read = |blob: &[u8], value, rerouted| {
                 translated::cached(&dxc::cache_dir(), blob, Stage::Compute, 0, 1, true, || {
                     Ok((compiled(value), rerouted))
                 }).unwrap().dxil[67]
             };
-            assert_eq!(read(b"console-enormous", marker, true), expected.parse::<u8>().unwrap());
-            assert_eq!(read(b"console-plain", marker + 16, false), 17);
+            assert_eq!(read(b"console-enormous", marker, true), expected);
+            let expected_primary = if crate::gpu::dxil::kernel::enabled() { expected + 16 } else { 17 };
+            assert_eq!(read(b"console-plain", marker + 16, false), expected_primary);
             return;
         }
 
@@ -1630,24 +1638,33 @@ mod shader_cache_tests {
         // to a shared disk cache, including the HLSL entry written by the first process.
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("xcl-translated-nesting-{}-{nonce}", std::process::id()));
-        for (nest, split, case) in [
-            ("0", "12500", "1:1"),
-            ("4", "12500", "2:2"),
-            ("4", "0", "3:3"),
-            ("off", "12500", "9:1"),
-            ("4", "12500", "9:2"),
-            ("4", "0", "9:3"),
+        for (direct, nest, split, prefer, case) in [
+            ("0", "0", "12500", "0", "1:1"),
+            ("0", "4", "12500", "0", "2:2"),
+            ("0", "4", "0", "0", "3:3"),
+            ("0", "off", "12500", "0", "9:1"),
+            ("0", "4", "12500", "0", "9:2"),
+            ("0", "4", "0", "0", "9:3"),
+            ("0", "4", "0", "1", "9:3"),
+            ("0", "0", "12500", "1", "4:4"),
+            ("0", "0", "12500", "1", "9:4"),
+            ("1", "0", "12500", "0", "5:5"),
+            ("1", "0", "12500", "1", "6:6"),
+            ("1", "0", "12500", "0", "9:5"),
         ] {
             let out = Command::new(std::env::current_exe().unwrap())
                 .args(["gpu::recomp::pso::shader_cache_tests::rerouted_disk_entries_follow_compact_nesting_policy", "--exact", "--nocapture"])
                 .env(RUN, case)
                 .env("XCL_DXIL_CACHE", &dir)
                 .env("XCL_TRANSLATED_CACHE", "1")
-                .env("XCL_DIRECT_DXIL", "0")
+                .env("XCL_DIRECT_DXIL", direct)
+                .env_remove("XCL_DIRECT_COMPACT")
                 .env("XCL_DIRECT_COMPACT_NEST", nest)
                 .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", split)
+                .env("XCL_DIRECT_PREFER_SPLIT", prefer)
                 .output().unwrap();
-            assert!(out.status.success(), "nest={nest}, split={split}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success(), "direct={direct}, nest={nest}, split={split}, prefer={prefer}: {}\n{}",
+                String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
