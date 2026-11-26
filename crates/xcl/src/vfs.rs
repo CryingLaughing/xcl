@@ -611,11 +611,26 @@ impl Vfs {
             self.commit_overlay_removal(rel);
             return Ok(());
         }
-        if !self.visible_in_original(rel) {
+        self.whiteout_original_file(rel, false)
+    }
+
+    pub(crate) fn whiteout_original_file(&self, rel: &str, check_readonly: bool) -> Result<(), u32> {
+        if self.is_whiteout(rel) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if Path::new(&self.original_path(rel)).is_dir() {
+        let original = self.original_path(rel);
+        let meta = std::fs::metadata(&original).map_err(|_| ERROR_FILE_NOT_FOUND)?;
+        if meta.is_dir() {
             return Err(ERROR_ACCESS_DENIED);
+        }
+        // DeleteFileW checks a file link's own attribute. Retiring a source after a
+        // VFS move has already published the new name and uses the existing move policy.
+        if check_readonly {
+            let entry = std::fs::symlink_metadata(&original)
+                .map_err(|e| e.raw_os_error().map_or(ERROR_ACCESS_DENIED, |code| code as u32))?;
+            if entry.permissions().readonly() {
+                return Err(ERROR_ACCESS_DENIED);
+            }
         }
         self.add_whiteout(rel);
         self.record_write(rel);

@@ -544,8 +544,51 @@ unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
     match v.classify(&path) {
         Target::Pass => orig(n),
         Target::Translated(p) => orig(wide(&p).as_ptr()),
-        Target::Game { rel } => bool_result(v.delete_file(&rel)),
+        Target::Game { rel } => bool_result(delete_file_w_vfs(v, &rel, orig)),
     }
+}
+
+fn delete_file_w_vfs(v: &vfs::Vfs, rel: &str, orig: FnPathW) -> Result<(), u32> {
+    let overlay = v.overlay_path(rel);
+    // A dangling reparse entry still takes precedence over the original game file.
+    match std::fs::symlink_metadata(&overlay) {
+        Ok(meta) if meta.is_dir() => return Err(vfs::ERROR_ACCESS_DENIED),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return v.whiteout_original_file(rel, true),
+        Err(e) => return Err(io_err_code(&e, vfs::ERROR_ACCESS_DENIED)),
+    }
+
+    let path = delete_overlay_path(&overlay)?;
+    // Use the native readonly and sharing checks at deletion time. Rust's remove_file
+    // can retry with FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE.
+    if unsafe { orig(path.as_ptr()) } == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    v.commit_overlay_removal(rel);
+    Ok(())
+}
+
+fn delete_overlay_path(path: &str) -> Result<Vec<u16>, u32> {
+    const MAX_PATH: usize = 260; // includes the terminating NUL
+    if path.starts_with(r"\\?\") || path.starts_with(r"\??\")
+        || (std::path::Path::new(path).is_absolute() && path.encode_utf16().count() < MAX_PATH)
+    {
+        return Ok(wide(path));
+    }
+    let absolute = std::path::absolute(path).map_err(|e| io_err_code(&e, vfs::ERROR_ACCESS_DENIED))?;
+    let absolute = absolute.to_string_lossy();
+    if absolute.encode_utf16().count() < MAX_PATH || absolute.starts_with(r"\\?\") || absolute.starts_with(r"\??\") {
+        return Ok(wide(&absolute));
+    }
+    // The extended prefix must follow absolutization so the path is already normalized.
+    let extended = if let Some(device) = absolute.strip_prefix(r"\\.\") {
+        format!(r"\\?\{device}")
+    } else if let Some(unc) = absolute.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{unc}")
+    } else {
+        format!(r"\\?\{absolute}")
+    };
+    Ok(wide(&extended))
 }
 
 /// Source for a copy/move: (real path to read, game rel if it lives in the game folder).
