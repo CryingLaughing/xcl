@@ -1652,6 +1652,12 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
 }
 
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+    enum GraphicsPreparation {
+        Pending,
+        RuntimeHandled,
+        Legacy,
+    }
+
     let pipelines = if pipelines {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
             .map_err(|e| format!("No pipeline device: {e}"))?;
@@ -1752,46 +1758,60 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
-                let (mut warmed_vs, mut warmed_ps) = (false, false);
+                let mut vs_preparation = GraphicsPreparation::Pending;
+                let mut ps_preparation = GraphicsPreparation::Pending;
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let runtime_stage = match (&mode, f.stages.first().map(|s| s.hw)) {
-                        (recomp::Mode::Vertex(_), Some(4)) => Some((recomp::pso::Stage::Vertex, &mut warmed_vs)),
-                        (recomp::Mode::Pixel(_), Some(5)) => Some((recomp::pso::Stage::Pixel, &mut warmed_ps)),
+                        (recomp::Mode::Vertex(_), Some(4)) => Some((recomp::pso::Stage::Vertex, &mut vs_preparation)),
+                        (recomp::Mode::Pixel(_), Some(5)) => Some((recomp::pso::Stage::Pixel, &mut ps_preparation)),
                         _ => None,
                     };
-                    if let Some((stage, warmed)) = runtime_stage {
-                        if *warmed || f.programs.is_empty() {
-                            continue;
-                        }
-                        *warmed = true;
-                        match recomp::pso::console_to_dxil_in_status(&blob, stage, 0, graphics_split, windows) {
-                            Ok((c, from_cache)) => {
-                                if stage == recomp::pso::Stage::Pixel {
-                                    ps_base0.fetch_add(1, Ordering::Relaxed);
-                                    if !c.samplers.is_empty() {
-                                        ps_static_samplers.fetch_add(1, Ordering::Relaxed);
+                    match runtime_stage {
+                        Some((_, GraphicsPreparation::RuntimeHandled)) => continue,
+                        Some((_, GraphicsPreparation::Legacy)) | None => {}
+                        Some((stage, preparation)) => {
+                            if f.programs.is_empty() {
+                                continue;
+                            }
+                            match recomp::pso::console_to_dxil_in_status(&blob, stage, 0, graphics_split, windows) {
+                                Ok((c, from_cache)) => {
+                                    *preparation = GraphicsPreparation::RuntimeHandled;
+                                    if stage == recomp::pso::Stage::Pixel {
+                                        ps_base0.fetch_add(1, Ordering::Relaxed);
+                                        if !c.samplers.is_empty() {
+                                            ps_static_samplers.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    } else if !c.samplers.is_empty() {
+                                        vs_static_samplers.fetch_add(1, Ordering::Relaxed);
                                     }
-                                } else if !c.samplers.is_empty() {
-                                    vs_static_samplers.fetch_add(1, Ordering::Relaxed);
+                                    if from_cache {
+                                        cached.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        compiled.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    continue;
                                 }
-                                if from_cache {
-                                    cached.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    compiled.fetch_add(1, Ordering::Relaxed);
+                                Err(_) if startup.is_some() => {
+                                    // Use the existing startup policy for this FSSM and every
+                                    // later variant of the same stage.
+                                    *preparation = GraphicsPreparation::Legacy;
                                 }
-                            }
-                            Err(e) => {
-                                let mut g = errors.lock().unwrap();
-                                if g.len() < 10 {
-                                    g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                                Err(e) => {
+                                    *preparation = GraphicsPreparation::RuntimeHandled;
+                                    let mut g = errors.lock().unwrap();
+                                    if g.len() < 10 {
+                                        g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                                    }
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
                                 }
-                                failed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        continue;
                     }
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
+                        recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
+                        recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
                         recomp::Mode::Compute(_) => vec![("cs_6_6", None)],
                         recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::mesh_passthrough(ms)))],
                         _ => {
@@ -1803,6 +1823,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         let code = &f.data[p.offset..p.offset + p.len];
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
+                        let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
                             Ok(t) if t.complete() => t,
