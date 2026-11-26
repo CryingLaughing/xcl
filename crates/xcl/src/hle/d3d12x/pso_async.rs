@@ -8,14 +8,22 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+
+#[repr(u8)]
+enum RegularQueue {
+    Unsent,
+    Sending,
+    Sent,
+    Disconnected,
+}
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
-    /// the build went to the workers (a lazy one goes on its first `resolve`)
-    sent: std::sync::atomic::AtomicBool,
+    /// Admission to the regular queue. Preload and inline builds use `job` independently.
+    regular_queue: AtomicU8,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
@@ -92,6 +100,10 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
 }
 
 impl Pending {
+    fn queue_disconnected(&self) -> bool {
+        self.regular_queue.load(Ordering::Acquire) == RegularQueue::Disconnected as u8
+    }
+
     /// One of the title's threads is about to wait for it: the worker building it goes on now,
     /// at a normal priority.
     fn want(&self) {
@@ -313,8 +325,28 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     })
 }
 
-fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
+fn enqueue(p: &Arc<Pending>) -> bool {
+    enqueue_on(p, |work| queue().lock().unwrap().send(work).is_ok())
+}
+
+/// Submit once. A concurrent caller can continue its bounded wait while the send is in progress.
+/// A disconnected channel cannot reopen, but an unlimited bind can still take the retained job.
+fn enqueue_on(p: &Arc<Pending>, send: impl FnOnce(Work) -> bool) -> bool {
+    if let Err(state) = p.regular_queue.compare_exchange(
+        RegularQueue::Unsent as u8, RegularQueue::Sending as u8, Ordering::AcqRel, Ordering::Acquire,
+    ) {
+        return state != RegularQueue::Disconnected as u8;
+    }
+    let work = p.clone();
+    if send(Box::new(move || build_queued(&work))) {
+        p.regular_queue.store(RegularQueue::Sent as u8, Ordering::Release);
+        return true;
+    }
+    // Hold the wait mutex while publishing the rejection to avoid missing a concurrent bind.
+    let _done = p.done.lock().unwrap();
+    p.regular_queue.store(RegularQueue::Disconnected as u8, Ordering::Release);
+    p.cv.notify_all();
+    false
 }
 
 fn build_queued(p: &Arc<Pending>) {
@@ -388,7 +420,7 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(send),
+        regular_queue: AtomicU8::new(RegularQueue::Unsent as u8),
         real: AtomicUsize::new(0),
         driver: AtomicUsize::new(0),
         done: Mutex::new(false),
@@ -407,7 +439,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        enqueue(p);
+        enqueue(&p);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -559,6 +591,51 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn a_disconnected_regular_queue_keeps_the_job_for_an_unlimited_bind() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let standin = 0x7E57_C351;
+        let real = 0xC351;
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_job = ran.clone();
+        submit_lazy(standin, true, Box::new(move || {
+            ran_job.store(true, Ordering::Release);
+            real
+        }), 0);
+        let pending = entry(standin).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        assert!(!enqueue_on(&pending, |work| {
+            // An image-only bind can observe `Sending` before this send returns its error.
+            assert_eq!(resolve_spared(&pending, standin), standin);
+            assert!(!pending.late.load(Ordering::Acquire), "an in-progress send has not admitted the job");
+            sender.send(work).is_ok()
+        }));
+        assert!(pending.queue_disconnected());
+        assert_eq!(resolve_wait_for(standin, Some(Duration::ZERO)), standin);
+        assert!(is_pending(standin), "the retained job can still build inline");
+        assert!(!pending.late.load(Ordering::Acquire), "the channel declined without a wait timeout");
+        assert!(!ran.load(Ordering::Acquire), "a bounded bind must not run the job inline");
+        assert_eq!(resolve_wait_for(standin, None), real);
+        assert!(ran.load(Ordering::Acquire));
+        assert!(!is_pending(standin));
+        assert_eq!(released(standin), real);
+
+        let healthy_standin = 0x7E57_C352;
+        let healthy_real = 0xC352;
+        submit_lazy(healthy_standin, true, Box::new(move || healthy_real), 0);
+        let healthy = entry(healthy_standin).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        assert!(enqueue_on(&healthy, |work| sender.send(work).is_ok()));
+        assert_eq!(healthy.regular_queue.load(Ordering::Acquire), RegularQueue::Sent as u8);
+        assert!(enqueue_on(&healthy, |_| panic!("a second build was sent")));
+        receiver.try_recv().expect("the admitted job reached the worker queue")();
+        assert_eq!(resolve_wait_for(healthy_standin, Some(Duration::ZERO)), healthy_real);
+        assert_eq!(released(healthy_standin), healthy_real);
+    }
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
@@ -1055,9 +1132,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
-            }
+            enqueue(&p);
             stand
         }
         r => r,
@@ -1117,15 +1192,18 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if *p.done.lock().unwrap() {
         return built(p);
     }
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        enqueue(p.clone());
+    if !enqueue(p) {
+        // Preload may still be able to build the job on its own worker.
+        p.want();
+        return built(p);
     }
     if p.late.load(Ordering::Acquire) {
         return p.stand(pso);
     }
     p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
+    // Completion and disconnection both publish while holding the wait mutex.
+    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d && !p.queue_disconnected()).unwrap();
+    if *done || p.queue_disconnected() {
         return built(p);
     }
     drop(done);
@@ -1165,10 +1243,11 @@ pub fn image_only(standin: usize) {
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p.clone());
-            }
-            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+            enqueue(p);
+            // A concurrent sender may still be submitting the job when this bind returns.
+            if p.regular_queue.load(Ordering::Acquire) == RegularQueue::Sent as u8
+                && !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel)
+            {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 16 || n.is_power_of_two() {
