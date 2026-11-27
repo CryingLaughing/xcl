@@ -104,19 +104,48 @@ fn disk_free_space_ex_reports_pls_quota() {
         assert_eq!((ansi_available, ansi_free), (available, free));
 
         if GetOEMCP() == 437 {
+            use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceA, GetDiskFreeSpaceW};
+
+            let wide_geometry = |path: &[u16]| {
+                let [mut sectors, mut bytes, mut free, mut total] = [0; 4];
+                assert_ne!(
+                    GetDiskFreeSpaceW(path.as_ptr(), &mut sectors, &mut bytes, &mut free, &mut total),
+                    0
+                );
+                [sectors, bytes, total]
+            };
+            let mounted = wide(r"S:\café");
+            let physical = wide(&pls.join("café").to_string_lossy());
+            let geometry = wide_geometry(&mounted);
+            assert_eq!(geometry[..2], wide_geometry(&physical)[..2]);
+            assert!(geometry[0] > 0 && geometry[1] > 0);
+
+            let oem_path = c"S:\\caf\x82";
+            let [mut sectors, mut bytes, mut legacy_free, mut legacy_total] = [0; 4];
             let was_ansi = AreFileApisANSI() != 0;
             SetFileApisToOEM();
             let result = GetDiskFreeSpaceExA(
-                c"S:\\caf\x82".as_ptr().cast(),
+                oem_path.as_ptr().cast(),
                 &mut ansi_available,
                 null_mut(),
                 null_mut(),
             );
+            let legacy = GetDiskFreeSpaceA(
+                oem_path.as_ptr().cast(),
+                &mut sectors,
+                &mut bytes,
+                &mut legacy_free,
+                &mut legacy_total,
+            );
+            let legacy_error = GetLastError();
             if was_ansi {
                 SetFileApisToANSI();
             }
             assert_ne!(result, 0);
             assert_eq!(ansi_available, available);
+            assert_ne!(legacy, 0, "GetDiskFreeSpaceA must decode the OEM directory (error {legacy_error})");
+            assert_eq!([sectors, bytes, legacy_total], geometry);
+            assert!(legacy_free <= legacy_total);
         }
 
         let alias = wide(r"P:\");

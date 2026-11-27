@@ -453,7 +453,7 @@ unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut
 unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
     let orig = orig!(O_DISK_FREE_A as FnDiskFreeA);
     let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
-    let Some(path) = from_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
+    let Some(path) = from_file_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
     let (r, real) = match read_target(&path) {
         None => (orig(n, spc, bps, nfree, ntotal), None),
         Some(Ok(p)) => (orig!(O_DISK_FREE_W as FnDiskFreeW)(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
