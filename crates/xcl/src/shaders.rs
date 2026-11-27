@@ -1236,13 +1236,64 @@ struct CacheIdentityProbe {
     equal_length_different: AtomicUsize,
     different_length: AtomicUsize,
     unavailable: AtomicUsize,
+    export_dir: Option<PathBuf>,
+    exports: AtomicUsize,
+    export_failures: AtomicUsize,
 }
 
 impl CacheIdentityProbe {
+    fn from_env() -> Result<Option<Self>, String> {
+        use std::os::windows::fs::MetadataExt;
+
+        let export = std::env::var("XCL_PSO_BLOB_EXPORT").as_deref() == Ok("1");
+        let observe = std::env::var("XCL_PSO_BLOB_IDENTITY_PROBE").as_deref() == Ok("1");
+        if !export {
+            return Ok(observe.then(Self::default));
+        }
+
+        let root = PathBuf::from(std::env::var("XCL_DXIL_CACHE")
+            .map_err(|_| "XCL_PSO_BLOB_EXPORT requires an explicit private XCL_DXIL_CACHE".to_owned())?);
+        const REPARSE_POINT: u32 = 0x400;
+        let is_plain_directory = std::fs::symlink_metadata(&root)
+            .is_ok_and(|info| info.is_dir() && info.file_attributes() & REPARSE_POINT == 0);
+        if !root.is_absolute() || !is_plain_directory {
+            return Err("XCL_PSO_BLOB_EXPORT requires an existing absolute private cache directory".into());
+        }
+        let export_dir = root.join("returned-driver");
+        std::fs::create_dir(&export_dir).map_err(|error| {
+            format!("XCL_PSO_BLOB_EXPORT could not create a fresh directory {}: {error}", export_dir.display())
+        })?;
+        Ok(Some(Self { export_dir: Some(export_dir), ..Self::default() }))
+    }
+
+    fn export_returned_blob(&self, cache_path: Option<&Path>, returned: &[u8]) {
+        use std::io::Write;
+
+        let Some(export_dir) = &self.export_dir else { return };
+        let driver_dir = export_dir.with_file_name("driver");
+        let leaf = cache_path
+            .filter(|path| path.parent() == Some(driver_dir.as_path()))
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                let stem = name.strip_suffix(".chain.pso").or_else(|| name.strip_suffix(".pso"));
+                name.len() <= 64 && stem.is_some_and(|stem| {
+                    !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                })
+            });
+        let saved = leaf.is_some_and(|name| {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(export_dir.join(name))
+                .and_then(|mut file| file.write_all(returned)).is_ok()
+        });
+        let count = if saved { &self.exports } else { &self.export_failures };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_success(
         &self,
         supplied: &[u8],
         returned: Option<(&windows::Win32::Graphics::Direct3D::ID3DBlob, usize)>,
+        cache_path: Option<&Path>,
     ) {
         self.cached_success.fetch_add(1, Ordering::Relaxed);
         let count = match returned {
@@ -1254,7 +1305,12 @@ impl CacheIdentityProbe {
                 } else {
                     // Compare only while `blob` owns the driver-provided buffer.
                     let returned_bytes = unsafe { std::slice::from_raw_parts(pointer, size) };
-                    if returned_bytes == supplied { &self.equal_bytes } else { &self.equal_length_different }
+                    if returned_bytes == supplied {
+                        &self.equal_bytes
+                    } else {
+                        self.export_returned_blob(cache_path, returned_bytes);
+                        &self.equal_length_different
+                    }
                 }
             }
             _ => &self.unavailable,
@@ -1504,11 +1560,11 @@ impl Pipelines {
     fn for_adapter(adapter: &str) -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
+        let cache_identity = CacheIdentityProbe::from_env()?;
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
             let probe_enabled = std::env::var("XCL_SPLIT_GATE_PROBE").as_deref() == Ok("1");
-            let cache_identity = std::env::var("XCL_PSO_BLOB_IDENTITY_PROBE").as_deref() == Ok("1");
             let dev = if sel == crate::gpu::adapter::Selector::Warp {
                 let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
                 let dev = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
@@ -1529,7 +1585,7 @@ impl Pipelines {
             Ok(Pipelines {
                 dev,
                 signatures: Mutex::new(Default::default()),
-                cache_identity: cache_identity.then(CacheIdentityProbe::default),
+                cache_identity,
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
@@ -1672,7 +1728,7 @@ impl Pipelines {
                     let blob = unsafe { pso.GetCachedBlob() };
                     let returned = blob.as_ref().ok().map(|blob| (blob, unsafe { blob.GetBufferSize() }));
                     if let Some(probe) = &self.cache_identity {
-                        probe.record_success(bytes, returned);
+                        probe.record_success(bytes, returned, path.as_deref());
                     }
                     returned.is_some_and(|(_, size)| size == bytes.len())
                 })
@@ -1947,11 +2003,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
         if let Some(probe) = &p.cache_identity {
             println!(
-                "split gate cache identity: cached_calls={} cached_success={} uncached_calls={} equal_bytes={} equal_length_different={} different_length={} unavailable={}",
+                "split gate cache identity: cached_calls={} cached_success={} uncached_calls={} equal_bytes={} equal_length_different={} different_length={} unavailable={} exports={} export_failures={}",
                 probe.cached_calls.load(Ordering::Relaxed), probe.cached_success.load(Ordering::Relaxed),
                 probe.uncached_calls.load(Ordering::Relaxed), probe.equal_bytes.load(Ordering::Relaxed),
                 probe.equal_length_different.load(Ordering::Relaxed), probe.different_length.load(Ordering::Relaxed),
                 probe.unavailable.load(Ordering::Relaxed),
+                probe.exports.load(Ordering::Relaxed), probe.export_failures.load(Ordering::Relaxed),
             );
         }
         let admission = p.running.0.lock().unwrap();
