@@ -1179,7 +1179,12 @@ unsafe extern "system" fn voice_discontinuity(this: *mut c_void) -> HRESULT {
     let mut queue: XAudio2VoiceState = std::mem::zeroed();
     // The native call can only mark a buffer already in the queue.
     get_state(this, &mut queue, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    complete_discontinuity(&state, revision, queue.buffers_queued != 0, native(this))
+    #[cfg(test)]
+    tests::drain_for_discontinuity_probe(this, queue.buffers_queued, false);
+    let hr = native(this);
+    #[cfg(test)]
+    tests::drain_for_discontinuity_probe(this, queue.buffers_queued, true);
+    complete_discontinuity(&state, revision, queue.buffers_queued != 0, hr)
 }
 
 unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2VoiceState, flags: u32) {
@@ -1273,6 +1278,10 @@ mod tests {
 
     impl OpusBoundaryVoice {
         fn new() -> Option<Self> {
+            Self::new_with_callback(std::ptr::null_mut())
+        }
+
+        fn new_with_callback(callback: *mut c_void) -> Option<Self> {
             if !opus::is_available() {
                 eprintln!("skipping: MSOpusDecoder.dll not available");
                 return None;
@@ -1296,7 +1305,7 @@ mod tests {
                 format.extend_from_slice(&head);
                 let create_src: CreateSourceVoiceFn = std::mem::transmute(engine_vtable.add(ENGINE_CREATE_SOURCE_VOICE).read());
                 let null = std::ptr::null();
-                assert_eq!(create_src(fixture.engine, &mut fixture.voice, format.as_ptr().cast(), 0, 2.0, std::ptr::null_mut(), null, null), S_OK);
+                assert_eq!(create_src(fixture.engine, &mut fixture.voice, format.as_ptr().cast(), 0, 2.0, callback, null, null), S_OK);
                 assert!(!fixture.voice.is_null());
                 let set_volume: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vtable(fixture.voice).add(12).read());
                 assert_eq!(set_volume(fixture.voice, 0.0, 0), S_OK);
@@ -1329,27 +1338,130 @@ mod tests {
         }
 
         fn buffers_queued(&self) -> u32 {
-            unsafe {
-                let call: GetStateFn = std::mem::transmute(vtable(self.voice).add(VOICE_GET_STATE).read());
-                let mut state: XAudio2VoiceState = std::mem::zeroed();
-                call(self.voice, &mut state, 0x0100); // XAUDIO2_VOICE_NOSAMPLESPLAYED
-                state.buffers_queued
-            }
+            voice_state(self.voice, XAUDIO2_VOICE_NOSAMPLESPLAYED).buffers_queued
         }
 
         fn drain_and_stop(&self) {
-            unsafe {
-                let vt = vtable(self.voice);
-                let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt.add(19).read());
-                let stop: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt.add(20).read());
-                assert_eq!(start(self.voice, 0, 0), S_OK);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                while self.buffers_queued() != 0 {
-                    assert!(std::time::Instant::now() < deadline, "muted source voice did not drain");
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                assert_eq!(stop(self.voice, 0, 0), S_OK);
+            drain_muted_voice(self.voice);
+        }
+    }
+
+    fn voice_state(voice: *mut c_void, flags: u32) -> XAudio2VoiceState {
+        unsafe {
+            let call: GetStateFn = std::mem::transmute(vtable(voice).add(VOICE_GET_STATE).read());
+            let mut state: XAudio2VoiceState = std::mem::zeroed();
+            call(voice, &mut state, flags);
+            state
+        }
+    }
+
+    fn wait_for_audio(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "muted source voice did not complete its processing pass");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn drain_muted_voice(voice: *mut c_void) {
+        unsafe {
+            let vt = vtable(voice);
+            let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt.add(19).read());
+            let stop: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt.add(20).read());
+            assert_eq!(start(voice, 0, 0), S_OK);
+            wait_for_audio(|| voice_state(voice, XAUDIO2_VOICE_NOSAMPLESPLAYED).buffers_queued == 0);
+            assert_eq!(stop(voice, 0, 0), S_OK);
+        }
+    }
+
+    thread_local! {
+        static DRAIN_AFTER_NATIVE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn drain_for_discontinuity_probe(voice: *mut c_void, snapshot: u32, after_native: bool) {
+        DRAIN_AFTER_NATIVE.with(|armed| {
+            if armed.get() == Some(after_native) {
+                armed.set(None);
+                assert_eq!(snapshot, 1);
+                let before = voice_state(voice, XAUDIO2_VOICE_NOSAMPLESPLAYED).buffers_queued;
+                assert_eq!(before, 1);
+                drain_muted_voice(voice);
+                let after = voice_state(voice, XAUDIO2_VOICE_NOSAMPLESPLAYED).buffers_queued;
+                assert_eq!(after, 0);
             }
+        });
+    }
+
+    #[repr(C)]
+    struct BoundaryCallback {
+        vtbl: &'static VoiceCallbackVtbl,
+        buffers_ended: AtomicUsize,
+        streams_ended: AtomicUsize,
+        passes_after_end: AtomicUsize,
+    }
+
+    static BOUNDARY_CALLBACK: VoiceCallbackVtbl = VoiceCallbackVtbl {
+        pass_start: boundary_pass_start,
+        pass_end: boundary_pass_end,
+        stream_end: boundary_stream_end,
+        buffer_start: boundary_buffer_noop,
+        buffer_end: boundary_buffer_end,
+        loop_end: boundary_buffer_noop,
+        voice_error: boundary_error,
+    };
+
+    unsafe extern "system" fn boundary_pass_start(_: *mut c_void, _: u32) {}
+    unsafe extern "system" fn boundary_buffer_noop(_: *mut c_void, _: *mut c_void) {}
+    unsafe extern "system" fn boundary_error(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+
+    unsafe extern "system" fn boundary_pass_end(this: *mut c_void) {
+        let cb = &*this.cast::<BoundaryCallback>();
+        if cb.buffers_ended.load(Ordering::Acquire) != 0 {
+            cb.passes_after_end.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn boundary_stream_end(this: *mut c_void) {
+        (*this.cast::<BoundaryCallback>()).streams_ended.fetch_add(1, Ordering::Release);
+    }
+
+    unsafe extern "system" fn boundary_buffer_end(this: *mut c_void, _: *mut c_void) {
+        (*this.cast::<BoundaryCallback>()).buffers_ended.fetch_add(1, Ordering::Release);
+    }
+
+    #[test]
+    fn opus_discontinuity_native_queue_ordering_probe() {
+        let packet = opus::tests::MONO_HYBRID_20MS[0];
+        for (case, schedule, flags, streams, frames) in [
+            ("drain-before-native", Some(false), 0, 0, 840),
+            ("drain-after-native", Some(true), 0, 1, 840),
+            ("previously-marked-drain-before-native", Some(false), XAUDIO2_END_OF_STREAM, 1, 840),
+            ("already-empty", None, 0, 0, 960),
+        ] {
+            let mut cb = Box::new(BoundaryCallback {
+                vtbl: &BOUNDARY_CALLBACK,
+                buffers_ended: AtomicUsize::new(0),
+                streams_ended: AtomicUsize::new(0),
+                passes_after_end: AtomicUsize::new(0),
+            });
+            let Some(voice) = OpusBoundaryVoice::new_with_callback((&mut *cb as *mut BoundaryCallback).cast()) else { return };
+            assert_eq!(voice.submit(packet, flags, 1).len() / 2, 840);
+            if schedule.is_none() {
+                voice.drain_and_stop();
+            }
+            DRAIN_AFTER_NATIVE.with(|armed| armed.set(schedule));
+            assert_eq!(voice.discontinuity(), S_OK);
+            DRAIN_AFTER_NATIVE.with(|armed| assert_eq!(armed.get(), None));
+            wait_for_audio(|| cb.passes_after_end.load(Ordering::Acquire) != 0);
+            let state = voice_state(voice.voice, 0);
+            let queued = state.buffers_queued;
+            let samples = state.samples_played;
+            assert_eq!(queued, 0);
+            let ended = cb.streams_ended.load(Ordering::Acquire);
+            let next = voice.submit(packet, 0, 2).len() / 2;
+            println!("{case}: native queue={queued}, samples={samples}, stream ends={ended}, next Opus frames={next}");
+            assert_eq!(ended, streams, "native end-of-stream for {case}");
+            assert_eq!(next, frames, "recorded archived behavior for {case}");
         }
     }
 
