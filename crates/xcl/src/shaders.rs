@@ -1902,6 +1902,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 probe.total_wait.as_nanos(), probe.max_wait.as_nanos(), admission.active,
                 probe.waiters, probe.waiting_cache_bytes,
             );
+            let cache = recomp::dxc::cache_stats();
+            let (running, finished) = recomp::dxc::compile_counts();
+            println!(
+                "split gate HLSL cache: hits={} misses={} attempts={} failures={} running_end={} finished={}",
+                cache.hits, cache.misses, cache.compilations, cache.compilation_failures, running, finished,
+            );
+            println!("{}", crate::gpu::dxil::coverage::fallback_summary());
         }
         drop(admission);
         let split_programs = p.split_programs.load(Ordering::Relaxed);
