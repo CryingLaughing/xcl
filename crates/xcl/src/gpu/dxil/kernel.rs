@@ -491,8 +491,7 @@ mod chain_preservation_tests {
     use super::*;
     use crate::gpu::rdna2::encode;
 
-    #[test]
-    fn automatic_compact_can_keep_an_ordinary_compute_chain() {
+    fn compact_chain_fixture() -> (Cfg, KernelOptions, Entry, DispatchOptions) {
         let mut code = Vec::new();
         let mut emit = |name, encoding, fields: &[(&str, u64)]| {
             code.extend(encode(name, encoding, fields, None).unwrap());
@@ -518,6 +517,12 @@ mod chain_preservation_tests {
             // on the production profitability threshold of 20,000 guest instructions.
             auto_plan: |cfg, lw, _, _| super::super::compact::plan(cfg, lw),
         };
+        (cfg, kernel, entry, opts)
+    }
+
+    #[test]
+    fn automatic_compact_can_keep_an_ordinary_compute_chain() {
+        let (cfg, kernel, entry, opts) = compact_chain_fixture();
         let compact = translate_cfg(&cfg, kernel, &entry, opts).unwrap();
         let ordinary = translate_cfg(&cfg, kernel, &entry, DispatchOptions {
             compact: Some(false), prefer_split_chain: true, ..opts
@@ -541,6 +546,32 @@ mod chain_preservation_tests {
         assert_eq!(combined.static_samplers, ordinary.static_samplers);
         println!("COMPACT_CHAIN whole={} B ordinary={} B pieces={} scratch={} dwords/group",
             combined.dxil.len(), ordinary.dxil.len(), combined_chain.pieces.len(), combined_chain.dwords_per_group);
+    }
+
+    #[test]
+    fn gpu_preserved_compact_chain_and_whole_fallback_match() {
+        if !std::env::var("XCL_TEST_COMPACT_CHAIN_NATIVE").is_ok_and(|value| value == "1") { return; }
+        if let Err(reason) = crate::gpu::recomp::runner::adapter() {
+            crate::gpu::recomp::runner::skip_test(&format!("no GPU: {reason}"));
+            return;
+        }
+        let (cfg, kernel, entry, opts) = compact_chain_fixture();
+        let combined = translate_cfg(&cfg, kernel, &entry, DispatchOptions { prefer_split_chain: true, ..opts }).unwrap();
+        let chain = combined.dispatch_chain.as_ref().expect("preserved ordinary split plan");
+        assert_eq!(chain.pieces.len(), 5);
+        assert_eq!(chain.dwords_per_group, 256);
+        const LANES: usize = 32;
+        const WORDS: usize = 24 * LANES;
+        const SKIPPED_REGION: usize = 7;
+        const GUARD: u32 = 0xaabb_ccdd;
+        let input = [GUARD; WORDS + 16];
+        let mut expected = input;
+        for (i, word) in expected[..WORDS].iter_mut().enumerate() {
+            if i / LANES != SKIPPED_REGION { *word = (i % LANES) as u32; }
+        }
+        let sgprs = [0, 0, (WORDS * 4) as u32, 0, SKIPPED_REGION as u32];
+        crate::hle::d3d12x::real::verify_compact_chain_outputs(&combined, &sgprs, &input, &expected)
+            .expect("native ordinary pieces and compact whole fallback");
     }
 
     #[test]

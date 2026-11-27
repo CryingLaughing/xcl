@@ -1734,6 +1734,24 @@ pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12Roo
     }
 }
 
+#[cfg(test)]
+pub(crate) fn unwrapped_test_device() -> Result<ID3D12Device, String> {
+    let mut gpu = GPU.lock().unwrap();
+    gpu.get_or_insert_with(init).as_ref().map(|gpu| gpu.dev.clone()).map_err(|error| error.clone())
+}
+
+type RecordDispatch<'a> = dyn FnMut(&ID3D12GraphicsCommandList, &ID3D12CommandAllocator, [u32; 3]) -> Result<(), String> + 'a;
+
+#[cfg(test)]
+pub(crate) fn dispatch_on_recording(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12RootSignature,
+    groups: [u32; 3], sgprs: &[u32], mem: &[u32], record: &mut RecordDispatch<'_>) -> Result<Vec<u32>, String> {
+    unsafe {
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        dispatch_with_recording(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false, None, Some(record)).map(|(m, _)| m)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with(
     dev: &ID3D12Device,
@@ -1748,6 +1766,25 @@ fn dispatch_with(
     reps: usize,
     timed: bool,
     chain: Option<(&[ID3D12PipelineState], u32, u64)>,
+) -> Result<(Vec<u32>, Vec<f64>), String> {
+    dispatch_with_recording(dev, queue, fence, value, pso, rs, groups, sgprs, mem, reps, timed, chain, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_recording(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    value: &mut u64,
+    pso: &ID3D12PipelineState,
+    rs: &ID3D12RootSignature,
+    groups: [u32; 3],
+    sgprs: &[u32],
+    mem: &[u32],
+    reps: usize,
+    timed: bool,
+    chain: Option<(&[ID3D12PipelineState], u32, u64)>,
+    mut record: Option<&mut RecordDispatch<'_>>,
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
@@ -1824,7 +1861,9 @@ fn dispatch_with(
             if let Some((heap, _)) = &queries {
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
             }
-            if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
+            if let Some(record) = record.as_mut() {
+                record(&list, &alloc, groups)?;
+            } else if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
                 super::pso::record_dispatch_chain(&list, groups, most, scratch, k > 0, pieces);
             } else {
                 list.Dispatch(groups[0], groups[1], groups[2]);

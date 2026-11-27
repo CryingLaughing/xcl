@@ -4723,6 +4723,62 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
 }
 
 #[cfg(test)]
+pub(crate) fn verify_compact_chain_outputs(kernel: &crate::gpu::dxil::kernel::Kernel,
+    sgprs: &[u32], input: &[u32], expected: &[u32]) -> Result<(), String> {
+    use crate::gpu::{recomp::runner, shader::fnv64};
+
+    static WHOLE_HASH: AtomicU64 = AtomicU64::new(0);
+    static WHOLE_CREATES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn trace_create(this: *mut c_void, desc: *const c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        let compute = &*desc.cast::<D3D12_COMPUTE_PIPELINE_STATE_DESC>();
+        if shader_bytes(&compute.CS).is_some_and(|dxil| fnv64(dxil) == WHOLE_HASH.load(Ordering::Relaxed)) {
+            WHOLE_CREATES.fetch_add(1, Ordering::Relaxed);
+        }
+        let dev = ID3D12Device::from_raw_borrowed(&this).expect("fixture owns the device");
+        (dev.vtable().CreateComputePipelineState)(this, compute, iid.cast(), out).0
+    }
+
+    assert!(!super::alloc_pool::enabled(), "fixture requires XCL_ALLOC_SWAP=0");
+    assert_eq!(std::env::var("XCL_PSO_DISK_CACHE").as_deref(), Ok("0"));
+    let dev = runner::unwrapped_test_device()?;
+    let pieces = kernel.dispatch_chain.as_ref().expect("preserved ordinary chain");
+    assert!(kernel.dxil.len() < 64 * 1024 && pieces.pieces.iter().all(|piece| piece.len() < 64 * 1024));
+    WHOLE_HASH.store(fnv64(&kernel.dxil), Ordering::Relaxed);
+    WHOLE_CREATES.store(0, Ordering::Relaxed);
+    let mut first = std::ptr::null_mut();
+    let signature = unsafe {
+        dispatch_chain::build(dev.as_raw(), trace_create, &D3D12_COMPUTE_PIPELINE_STATE_DESC::default(),
+            &pc_iid(Kind::PipelineState), &mut first, 0, &kernel.dxil, &kernel.static_samplers, pieces.clone())
+    }.ok_or("native chain creation failed")? as *mut c_void;
+    let first_pso = unsafe { ID3D12PipelineState::from_raw(first) };
+    let root = unsafe { ID3D12RootSignature::from_raw_borrowed(&signature) }.ok_or("chain root signature missing")?;
+    assert_eq!(WHOLE_CREATES.load(Ordering::Relaxed), 0);
+
+    for (route, fallback) in [("pieces", false), ("whole", true)] {
+        let mut used = None;
+        let before = WHOLE_CREATES.load(Ordering::Relaxed);
+        let output = runner::dispatch_on_recording(&dev, &first_pso, root, [1, 1, 1], sgprs, input,
+            &mut |list, allocator, groups| {
+                let allocator = if fallback { 0 } else { allocator.as_raw() as usize };
+                used = Some((list.as_raw() as usize, allocator));
+                unsafe { dispatch_chain::dispatch(list, first as usize, allocator, groups) }
+            })?;
+        let (list, allocator) = used.expect("native dispatch recorded");
+        // Only release the split scratch after the runner has confirmed the submission fence.
+        dispatch_chain::list_reset(list);
+        if allocator != 0 { dispatch_chain::allocator_reset(allocator); }
+        let creates = WHOLE_CREATES.load(Ordering::Relaxed) - before;
+        assert_eq!(creates, fallback as usize, "whole creation count for {route}");
+        assert_eq!(output.as_slice(), expected, "guarded UAV readback through {route}");
+        println!("COMPACT_CHAIN_NATIVE route={route} whole_creates={creates} words={}", output.len());
+    }
+    dispatch_chain::forget(first as usize);
+    drop(first_pso);
+    Ok(())
+}
+
+#[cfg(test)]
 mod compute_blob_tests {
     #[test]
     fn recorded_split_selects_cached_whole_or_pieces() {
