@@ -6137,9 +6137,12 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.CS = bytecode(&tp.cs);
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    let profile_start = std::env::var_os("XCL_TEST_TWO_PASS_RAM_PROFILE").map(|_| std::time::Instant::now());
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
     let mut ccached = compute_blob(ckey);
+    let path_start = profile_start.map(|_| std::time::Instant::now());
     let cdisk = driver_cache::path(&tp.cs, 0);
+    let path_time = path_start.map(|start| start.elapsed());
     let cfrom_disk = ccached.is_none();
     if cfrom_disk {
         ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -6151,6 +6154,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
+    let pre_driver = profile_start.map(|start| start.elapsed());
     let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
@@ -6169,6 +6173,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         cin_driver += took;
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    if let (Some(path_time), Some(pre_driver)) = (path_time, pre_driver) {
+        eprintln!(
+            "two-pass-ram kind={kind} dxil={} input_blob={} source={} reused={creused} disk_path={} path_ns={} pre_driver_ns={} hr={hc:#x}",
+            tp.cs.len(), ccached.as_ref().map_or(0, |blob| blob.len()),
+            if ccached.is_none() { "cold" } else if cfrom_disk { "disk" } else { "ram" },
+            cdisk.is_some(), path_time.as_nanos(), pre_driver.as_nanos(),
+        );
+    }
     if hc >= 0 && !creused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
         if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {

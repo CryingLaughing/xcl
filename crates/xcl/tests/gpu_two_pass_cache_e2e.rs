@@ -586,3 +586,42 @@ float4 main(V v) : SV_Target0 { return v.p0; }
         eprintln!("{REPLAY_SKIP}");
     }
 }
+
+#[test]
+fn two_pass_compute_ram_hit_profile() {
+    if std::env::var_os("XCL_TEST_TWO_PASS_RAM_PROFILE").is_none() {
+        return;
+    }
+    assert!(dxc::location().is_ok(), "profile requires DXC");
+    assert_eq!(xcl::hle::d3d12x::backend(), xcl::hle::d3d12x::Backend::Real);
+    assert_eq!(runner::wave64_programs_supported(), Ok(true));
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+    assert!(mesh_ready(dev), "profile requires mesh shaders");
+    println!("profile adapter: {}", real::stats().adapter);
+
+    // This fixture is smaller than production retention's 16 KiB DXIL threshold.
+    real::force_driver_cache_fixture_retention();
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };
+float4 main(V v) : SV_Target0 { return v.p0; }
+", "main", "ps_6_6", &[]).unwrap();
+    let rs = empty_rs(dev);
+    let ms = synthetic_ms_container(false);
+    let (vs, gs) = synthetic_vs_gs_containers();
+    let baseline = real::two_pass_count();
+    for step in 0..=32 {
+        let mesh = build_ms_pso(dev, &rs, &ms, &ps);
+        let geometry = build_gs_pso(dev, &rs, &vs, &gs, &ps);
+        assert_eq!(real::two_pass_count(), baseline + 2);
+        if step == 0 {
+            assert!(blob_support(&mesh).1 && blob_support(&geometry).1);
+        }
+        if step == 0 || step == 32 {
+            assert_eq!(draw_two_pass_and_read(dev, &mesh, 0, true), [1.0, 0.0, 0.0, 1.0]);
+            assert_eq!(draw_two_pass_and_read(dev, &geometry, 1, true), [0.0, 1.0, 0.0, 1.0]);
+            println!("profile readback: step={step} MS=red GS=green");
+        }
+        drop((mesh, geometry));
+        assert_eq!(real::two_pass_count(), baseline);
+    }
+}
