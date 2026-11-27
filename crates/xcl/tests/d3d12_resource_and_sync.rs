@@ -194,7 +194,10 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
     };
     const TILE: usize = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES as usize;
     const PREFIX: usize = 4096;
-    const PHYSICAL: usize = TILE + PREFIX;
+    const CALLER_OFFSET: usize = TILE;
+    const PAYLOAD_START: usize = PREFIX + CALLER_OFFSET;
+    const PAYLOAD_END: usize = PAYLOAD_START + TILE;
+    const PHYSICAL: usize = PAYLOAD_END + PREFIX;
     const GUARD: u8 = 0xd3;
     const DMA_IID: GUID = GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
 
@@ -203,7 +206,7 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
         fn drop(&mut self) { self.0.free(self.1); }
     }
 
-    let Some(base) = uma.alloc(2 * TILE, TILE) else {
+    let Some(base) = uma.alloc(3 * TILE, TILE) else {
         runner::skip_test("no coherent UMA space for a console placed buffer");
         return;
     };
@@ -223,7 +226,7 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
         }
 
         let mut placed_raw: *mut c_void = ptr::null_mut();
-        let placed_desc = buffer_desc(TILE as u64, D3D12_RESOURCE_FLAG_NONE);
+        let placed_desc = buffer_desc((PHYSICAL - PREFIX) as u64, D3D12_RESOURCE_FLAG_NONE);
         let hr = call_console(dev.as_raw(), 44, &[
             allocation.1 + PREFIX, &placed_desc as *const _ as usize,
             D3D12_RESOURCE_STATE_COMMON.0 as usize, 0, &ID3D12Resource::IID as *const _ as usize,
@@ -233,10 +236,11 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
         assert!(!placed_raw.is_null());
         let placed = ID3D12Resource::from_raw(placed_raw);
         assert_eq!(real::buffer_delta(placed_raw as usize), PREFIX as u64);
-        println!("CopyTiles placement_delta={PREFIX}");
+        println!("CopyTiles placement_delta={PREFIX} caller_offset={CALLER_OFFSET} host_offset={PAYLOAD_START}");
 
         let mut tile: Option<ID3D12Resource> = None;
-        dev.CreateReservedResource(&placed_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tile).expect("reserve one buffer tile");
+        let tile_desc = buffer_desc(TILE as u64, D3D12_RESOURCE_FLAG_NONE);
+        dev.CreateReservedResource(&tile_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tile).expect("reserve one buffer tile");
         let tile = tile.unwrap();
         let mut heap: Option<ID3D12Heap> = None;
         dev.CreateHeap(&D3D12_HEAP_DESC {
@@ -249,7 +253,7 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
         let staging = create_committed(&dev, &heap_props(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
             &buffer_desc(2 * PHYSICAL as u64, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ);
         let readback = create_committed(&dev, &heap_props(D3D12_HEAP_TYPE_READBACK), D3D12_HEAP_FLAG_NONE,
-            &buffer_desc(PHYSICAL as u64, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST);
+            &buffer_desc((TILE + PHYSICAL) as u64, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST);
         let empty = D3D12_RANGE { Begin: 0, End: 0 };
         let mut mismatches = Vec::new();
 
@@ -261,15 +265,15 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
             queue.UpdateTileMappings(&tile, 1, Some(&start), Some(&region), &heap, 1,
                 Some(&D3D12_TILE_RANGE_FLAG_NONE), Some(&0), Some(&1), D3D12_TILE_MAPPING_FLAG_NONE);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            for (fence_value, to_tile) in [(1, true), (2, false)] {
-                let seed = (slot as u8) ^ ((fence_value as u8) << 6);
+            for (fence_value, host, to_tile) in [(1, true, true), (2, true, false), (3, false, true), (4, false, false)] {
+                let seed = (slot as u8) ^ ((fence_value as u8) * 43);
                 let payload = |i: usize| ((i * 37) ^ (i >> 8)) as u8 ^ seed;
-                let payload_start = if to_tile { PREFIX } else { 0 };
+                let staging_payload = if to_tile { PAYLOAD_START } else { 0 };
                 let mut mapped: *mut c_void = ptr::null_mut();
                 staging.Map(0, Some(&empty), Some(&mut mapped)).unwrap();
                 let bytes = std::slice::from_raw_parts_mut(mapped as *mut u8, 2 * PHYSICAL);
                 bytes.fill(GUARD);
-                for (i, b) in bytes[payload_start..payload_start + TILE].iter_mut().enumerate() { *b = payload(i); }
+                for (i, b) in bytes[staging_payload..staging_payload + TILE].iter_mut().enumerate() { *b = payload(i); }
                 staging.Unmap(0, None);
 
                 let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(list_type).unwrap();
@@ -298,22 +302,28 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
                 transition(&tile, common, dst);
                 let flags = if to_tile { D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE }
                     else { D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER };
-                let copy_console = || call_console(raw, slot, &[tile.as_raw() as usize, &start as *const _ as usize,
-                    &region as *const _ as usize, placed_raw as usize, 0, flags.0 as usize]);
-                let (read_count, expected_prefix) = if to_tile {
-                    copy_console();
+                let copy = || {
+                    if host {
+                        list.CopyTiles(&tile, &start, &region, &placed, PAYLOAD_START as u64, flags);
+                    } else {
+                        call_console(raw, slot, &[tile.as_raw() as usize, &start as *const _ as usize,
+                            &region as *const _ as usize, placed_raw as usize, CALLER_OFFSET, flags.0 as usize]);
+                    }
+                };
+                let linear_readback = if to_tile {
+                    copy();
                     transition(&tile, dst, src);
                     list.CopyTiles(&tile, &start, &region, &readback, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
-                    (TILE, 0)
+                    TILE
                 } else {
                     list.CopyTiles(&tile, &start, &region, &staging, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
                     transition(&tile, dst, src);
                     transition(&placed, common, dst);
-                    copy_console();
+                    copy();
                     transition(&placed, dst, src);
-                    list.CopyBufferRegion(&readback, 0, &placed, 0, PHYSICAL as u64);
-                    (PHYSICAL, PREFIX)
+                    0
                 };
+                list.CopyBufferRegion(&readback, linear_readback as u64, &placed, 0, PHYSICAL as u64);
                 transition(&tile, src, common);
                 transition(&placed, src, common);
                 list.Close().expect("tile copy list Close");
@@ -323,15 +333,20 @@ fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
                 dev.GetDeviceRemovedReason().expect("tile copy device remains live");
                 assert_eq!(fence.GetCompletedValue(), fence_value);
 
+                let read_count = linear_readback + PHYSICAL;
                 readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: read_count }), Some(&mut mapped)).unwrap();
                 let result = std::slice::from_raw_parts(mapped as *const u8, read_count);
-                let wrong = result.iter().enumerate().filter(|&(i, b)| *b != if i < expected_prefix { GUARD } else { payload(i - expected_prefix) }).count();
+                let linear = &result[linear_readback..];
+                let prefix_wrong = linear[..PAYLOAD_START].iter().filter(|&&b| b != GUARD).count();
+                let suffix_wrong = linear[PAYLOAD_END..].iter().filter(|&&b| b != GUARD).count();
+                let actual = if to_tile { &result[..TILE] } else { &linear[PAYLOAD_START..PAYLOAD_END] };
+                let payload_wrong = actual.iter().enumerate().filter(|&(i, b)| *b != payload(i)).count();
                 readback.Unmap(0, Some(&empty));
-                println!("CopyTiles slot={slot} to_tile={to_tile} fence={fence_value} read={read_count} mismatch={wrong}");
-                mismatches.push(wrong);
+                println!("CopyTiles slot={slot} host={host} to_tile={to_tile} fence={fence_value} payload={payload_wrong} prefix={prefix_wrong} suffix={suffix_wrong}");
+                mismatches.push((payload_wrong, prefix_wrong, suffix_wrong));
             }
         }
-        assert_eq!(mismatches, [0, 0, 0, 0], "graphics/DMA × upload/readback");
+        assert_eq!(mismatches, [(0, 0, 0); 8], "graphics/DMA × host/console × upload/readback");
     }
 }
 
