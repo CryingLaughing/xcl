@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_PATH_NOT_FOUND};
-use windows_sys::Win32::Globalization::GetOEMCP;
+use windows_sys::Win32::Globalization::{GetACP, GetOEMCP};
 use windows_sys::Win32::Storage::FileSystem::{
-    AreFileApisANSI, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW, SetFileApisToANSI, SetFileApisToOEM,
+    AreFileApisANSI, GetDiskFreeSpaceA, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW, GetDiskFreeSpaceW,
+    SetFileApisToANSI, SetFileApisToOEM,
 };
 use xcl::config::{Boot, Config};
 use xcl::util::wide;
@@ -18,6 +19,15 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+unsafe fn query_clusters(
+    query: impl FnOnce(*mut u32, *mut u32, *mut u32, *mut u32) -> i32,
+) -> (i32, u32, [u32; 4]) {
+    let (mut sectors, mut bytes, mut free, mut total) = (17, 19, 23, 29);
+    SetLastError(9123);
+    let ok = query(&mut sectors, &mut bytes, &mut free, &mut total);
+    (ok, GetLastError(), [sectors, bytes, free, total])
 }
 
 #[test]
@@ -103,51 +113,6 @@ fn disk_free_space_ex_reports_pls_quota() {
         );
         assert_eq!((ansi_available, ansi_free), (available, free));
 
-        if GetOEMCP() == 437 {
-            use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceA, GetDiskFreeSpaceW};
-
-            let wide_geometry = |path: &[u16]| {
-                let [mut sectors, mut bytes, mut free, mut total] = [0; 4];
-                assert_ne!(
-                    GetDiskFreeSpaceW(path.as_ptr(), &mut sectors, &mut bytes, &mut free, &mut total),
-                    0
-                );
-                [sectors, bytes, total]
-            };
-            let mounted = wide(r"S:\café");
-            let physical = wide(&pls.join("café").to_string_lossy());
-            let geometry = wide_geometry(&mounted);
-            assert_eq!(geometry[..2], wide_geometry(&physical)[..2]);
-            assert!(geometry[0] > 0 && geometry[1] > 0);
-
-            let oem_path = c"S:\\caf\x82";
-            let [mut sectors, mut bytes, mut legacy_free, mut legacy_total] = [0; 4];
-            let was_ansi = AreFileApisANSI() != 0;
-            SetFileApisToOEM();
-            let result = GetDiskFreeSpaceExA(
-                oem_path.as_ptr().cast(),
-                &mut ansi_available,
-                null_mut(),
-                null_mut(),
-            );
-            let legacy = GetDiskFreeSpaceA(
-                oem_path.as_ptr().cast(),
-                &mut sectors,
-                &mut bytes,
-                &mut legacy_free,
-                &mut legacy_total,
-            );
-            let legacy_error = GetLastError();
-            if was_ansi {
-                SetFileApisToANSI();
-            }
-            assert_ne!(result, 0);
-            assert_eq!(ansi_available, available);
-            assert_ne!(legacy, 0, "GetDiskFreeSpaceA must decode the OEM directory (error {legacy_error})");
-            assert_eq!([sectors, bytes, legacy_total], geometry);
-            assert!(legacy_free <= legacy_total);
-        }
-
         let alias = wide(r"P:\");
         assert_ne!(
             GetDiskFreeSpaceExW(alias.as_ptr(), null_mut(), &mut total, null_mut()),
@@ -173,6 +138,64 @@ fn disk_free_space_ex_reports_pls_quota() {
         assert_eq!((result, error), (0, ERROR_PATH_NOT_FOUND));
         assert_eq!((available, total, free), (MIB - 579, host_total, MIB - 579));
 
+        let legacy_w = |path: &[u16]| {
+            query_clusters(|spc, bps, free, total| {
+                GetDiskFreeSpaceW(path.as_ptr(), spc, bps, free, total)
+            })
+        };
+        let legacy_a = |path: &[u8]| {
+            query_clusters(|spc, bps, free, total| {
+                GetDiskFreeSpaceA(path.as_ptr(), spc, bps, free, total)
+            })
+        };
+        let (ok, native_error, [sectors, bytes, host_free, host_total]) = legacy_w(&host);
+        assert_ne!(ok, 0);
+        let cluster = u64::from(sectors) * u64::from(bytes);
+        assert!(cluster != 0 && u64::from(host_free) * cluster >= MIB);
+        let expected_total = u64::from(host_total).min(MIB / cluster) as u32;
+        let expected_free = u64::from(host_free).min((MIB - 579) / cluster) as u32;
+        let expected = (ok, native_error, [sectors, bytes, expected_free, expected_total]);
+        let verify_oem = |expected_available, expected_legacy| {
+            if GetOEMCP() != 437 {
+                return;
+            }
+            let oem_path = b"S:\\caf\x82\0";
+            let was_ansi = AreFileApisANSI() != 0;
+            SetFileApisToOEM();
+            let mut available = 0;
+            let result = GetDiskFreeSpaceExA(oem_path.as_ptr(), &mut available, null_mut(), null_mut());
+            let legacy = legacy_a(oem_path);
+            if was_ansi {
+                SetFileApisToANSI();
+            }
+            assert_ne!(result, 0);
+            assert_eq!(available, expected_available);
+            assert_ne!(legacy.0, 0, "GetDiskFreeSpaceA must decode the OEM directory (error {})", legacy.1);
+            assert_eq!(legacy, expected_legacy);
+            assert_eq!(legacy_w(&wide(r"S:\café")), legacy);
+            println!("PLS OEM ACP={} OEMCP={} available={available} legacy={:?}", GetACP(), GetOEMCP(), legacy.2);
+        };
+        verify_oem(MIB - 579, expected);
+        for (t_ok, _, [t_sectors, t_bytes, t_free, t_total]) in
+            [legacy_w(&wide(r"T:\")), legacy_a(b"T:\\\0")]
+        {
+            assert_ne!(t_ok, 0);
+            assert_eq!([t_sectors, t_bytes, t_total], [sectors, bytes, host_total]);
+            assert!(u64::from(t_free) * cluster >= MIB);
+        }
+
+        let host_missing = wide(&pls.join("missing").to_string_lossy());
+        let native_failure = legacy_w(&host_missing);
+        assert_eq!(native_failure.0, 0);
+        assert_eq!(legacy_w(&missing), native_failure);
+        assert_eq!(legacy_a(b"S:\\missing\0"), native_failure);
+
+        assert_eq!(
+            [legacy_w(&alias), legacy_a(drive)],
+            [expected; 2],
+            "legacy PLS quota before fill (wide, ANSI)"
+        );
+
         fs::File::create(pls.join("fills-quota.bin"))
             .unwrap()
             .set_len(MIB)
@@ -182,6 +205,16 @@ fn disk_free_space_ex_reports_pls_quota() {
             0
         );
         assert_eq!((available, total, free), (0, MIB, 0));
+        let full = (ok, native_error, [sectors, bytes, 0, expected_total]);
+        assert_eq!([legacy_w(&alias), legacy_a(drive)], [full; 2], "legacy PLS quota at capacity (wide, ANSI)");
+        verify_oem(0, full);
+        for (outside_ok, _, [outside_sectors, outside_bytes, outside_free, outside_total]) in
+            [legacy_w(&host), legacy_a(b"T:\\\0")]
+        {
+            assert_ne!(outside_ok, 0);
+            assert_eq!([outside_sectors, outside_bytes, outside_total], [sectors, bytes, host_total]);
+            assert!(outside_free > 0);
+        }
         assert_ne!(
             GetDiskFreeSpaceExA(drive.as_ptr(), null_mut(), null_mut(), null_mut()),
             0
