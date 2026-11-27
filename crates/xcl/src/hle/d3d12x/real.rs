@@ -6158,10 +6158,17 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.CS = bytecode(&tp.cs);
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    let profile_start = std::env::var_os("XCL_TEST_TWO_PASS_RAM_PROFILE").map(|_| std::time::Instant::now());
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
+    let mut path_time = None;
     let (ccached, mut cdisk, cfrom_disk) = resolve_compute_blob(
         compute_blob(ckey),
-        || driver_cache::path(&tp.cs, 0),
+        || {
+            let path_start = profile_start.map(|_| std::time::Instant::now());
+            let path = driver_cache::path(&tp.cs, 0);
+            path_time = path_start.map(|start| start.elapsed());
+            path
+        },
         driver_cache::load,
     );
     if let Some(b) = &ccached {
@@ -6171,6 +6178,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
+    let pre_driver = profile_start.map(|start| start.elapsed());
     let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
@@ -6189,6 +6197,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         cin_driver += took;
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    if let Some(pre_driver) = pre_driver {
+        eprintln!(
+            "two-pass-ram kind={kind} dxil={} input_blob={} source={} reused={creused} disk_path={} path_ns={} pre_driver_ns={} hr={hc:#x}",
+            tp.cs.len(), ccached.as_ref().map_or(0, |blob| blob.len()),
+            if ccached.is_none() { "cold" } else if cfrom_disk { "disk" } else { "ram" },
+            cdisk.is_some(), path_time.map_or(0, |time| time.as_nanos()), pre_driver.as_nanos(),
+        );
+    }
     if hc >= 0 && !creused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
         if let Some(b) = compute_blob(ckey) {
