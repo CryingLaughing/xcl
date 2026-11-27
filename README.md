@@ -279,6 +279,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
+  The experimental `XCL_DIRECT_PREFER_SPLIT=1` also tries ordinary lowering when automatic
+  compact lowering chooses a whole pipeline for a split-eligible compute shader. When both forms
+  use the same ordered static samplers, XCL keeps the ordinary dispatch pieces and the compact
+  whole fallback. This can cost a second translation on a cold cache. Forced compact and plain
+  modes, disabled splitting, and shaders that cannot be split keep their existing behavior.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so

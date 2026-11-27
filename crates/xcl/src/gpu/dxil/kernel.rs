@@ -74,6 +74,12 @@ pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
+/// Keep a compatible ordinary dispatch chain when automatic lowering chooses a compact whole.
+pub(crate) fn prefer_split_chain() -> bool {
+    std::env::var("XCL_DIRECT_PREFER_SPLIT").is_ok_and(|value| value == "1")
+        && compact_mode().is_none() && dispatch_piece_limit() != 0
+}
+
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
 pub fn compact_mode() -> Option<bool> {
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
@@ -186,6 +192,16 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
+#[derive(Clone, Copy)]
+struct DispatchOptions {
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+    split_limit: usize,
+    prefer_split_chain: bool,
+    auto_plan: fn(&Cfg, &Lw, bool, usize) -> Option<super::compact::Plan>,
+}
+
 fn translate_on_this_thread(
     code: &[u8],
     o: KernelOptions,
@@ -194,13 +210,20 @@ fn translate_on_this_thread(
     nest: Option<super::compact::Nest>,
     tables: usize,
 ) -> Result<Kernel, String> {
-    let geo = match &entry {
-        Entry::Geometry(g) => Some(g.clone()),
-        _ => None,
+    let cfg = match &entry {
+        Entry::Geometry(g) => Cfg::build_geometry(code, g.gs_start)?,
+        _ => Cfg::build(code)?,
     };
-    let cfg = match &geo {
-        Some(g) => Cfg::build_geometry(code, g.gs_start)?,
-        None => Cfg::build(code)?,
+    translate_cfg(&cfg, o, &entry, DispatchOptions {
+        compact, nest, tables, split_limit: dispatch_piece_limit(), prefer_split_chain: prefer_split_chain(),
+        auto_plan: super::compact::automatic_plan,
+    })
+}
+
+fn translate_cfg(cfg: &Cfg, o: KernelOptions, entry: &Entry, options: DispatchOptions) -> Result<Kernel, String> {
+    let geo = match entry {
+        Entry::Geometry(g) => Some(g),
+        _ => None,
     };
     let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
@@ -208,12 +231,12 @@ fn translate_on_this_thread(
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
-    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    let mut lw = Lw::new(&cfg.insts, &leaders, o, entry);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
     let mut split_tid = None;
-    let numthreads = match &entry {
+    let numthreads = match entry {
         Entry::Kernel => {
             lw.setup_lanes();
             let lane = lw.lane;
@@ -278,18 +301,18 @@ fn translate_on_this_thread(
         }
     }
 
-    let plan = match compact {
+    let plan = match options.compact {
         _ if !compute && !kernel => None,
         Some(false) => None,
-        Some(true) => super::compact::plan(&cfg, &lw),
-        None => super::compact::automatic_plan(&cfg, &lw, compute && split, tables),
+        Some(true) => super::compact::plan(cfg, &lw),
+        None => (options.auto_plan)(cfg, &lw, compute && split, options.tables),
     };
     if let Some(p) = &plan {
         crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
     }
     let n = cfg.blocks.len();
     let mut heads: Vec<Option<Block>> = vec![None; n];
-    let entry = *cfg.rpo.first().ok_or("empty program")?;
+    let entry_block = *cfg.rpo.first().ok_or("empty program")?;
     // split geometry mode: the GS's first block is entered from the phase switch (one edge)
     // instead of from the ES blocks that jump there
     if let (Some(g), true) = (&geo, split) {
@@ -304,14 +327,14 @@ fn translate_on_this_thread(
         if let Some(h) = heads[b] {
             return h;
         }
-        let preds = cfg.blocks[b].preds.len() + (b == entry) as usize;
+        let preds = cfg.blocks[b].preds.len() + (b == entry_block) as usize;
         let h = lw.block(Some(preds));
         heads[b] = Some(h);
         h
     };
     // geometry mode: which blocks are GS code; the split form runs the ES in both hardware
     // waves, then (`switch`: a group barrier) the GS in the lower one with fresh registers
-    let gs_start = geo.as_ref().and_then(|g| g.gs_start);
+    let gs_start = geo.and_then(|g| g.gs_start);
     let in_gs = |b: usize| gs_start.is_some_and(|s| cfg.blocks[b].pc >= s);
     let two_phase = split && gs_start.is_some_and(|s| s > 0);
     let gs_only = split && gs_start == Some(0);
@@ -320,7 +343,7 @@ fn translate_on_this_thread(
         lw.partner = Partner::Missing;
         lw.xn = lw.c(0);
     }
-    let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
+    let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry_block) };
     let exit = lw.block(None);
     if gs_only {
         // the GS alone: in the lower hardware wave only
@@ -335,12 +358,12 @@ fn translate_on_this_thread(
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
     // the other stages enter their code by edges the CFG does not hold)
-    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
+    let reloads = if follow_loads { super::reload::analyze(cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
-        match nest {
-            Some(n) => super::compact::emit_with_nest(&mut lw, &cfg, p, h0, exit, n)?,
-            None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
+        match options.nest {
+            Some(n) => super::compact::emit_with_nest(&mut lw, cfg, p, h0, exit, n)?,
+            None => super::compact::emit(&mut lw, cfg, p, h0, exit)?,
         }
     }
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
@@ -443,8 +466,96 @@ fn translate_on_this_thread(
     lw.s.m.set_block(Block(0));
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
-    lw.finish_dispatch(numthreads, hw, limit, split_tid)
+    let limit = if compute && (!split || split_tid.is_some()) { options.split_limit } else { 0 };
+    let mut lowered = lw.finish_dispatch(numthreads, hw, limit, split_tid)?;
+    if options.prefer_split_chain && options.compact.is_none() && plan.is_some() && limit > 0 && hw == 32
+        && (numthreads == [32, 1, 1] || split_tid.is_some()) && lowered.dispatch_chain.is_none() {
+        // The whole fallback stays compact. The ordinary pieces can share its root signature
+        // only if the ordered static sampler recipes match exactly. The ordinary translation
+        // still has to pass the usual splitter restrictions and DXIL validation.
+        if let Ok(ordinary) = translate_cfg(cfg, o, entry, DispatchOptions { compact: Some(false), ..options }) {
+            retain_ordinary_chain(&mut lowered, ordinary);
+        }
+    }
+    Ok(lowered)
+}
+
+fn retain_ordinary_chain(compact: &mut Kernel, ordinary: Kernel) {
+    if compact.static_samplers == ordinary.static_samplers {
+        compact.dispatch_chain = ordinary.dispatch_chain;
+    }
+}
+
+#[cfg(test)]
+mod chain_preservation_tests {
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    #[test]
+    fn automatic_compact_can_keep_an_ordinary_compute_chain() {
+        let mut code = Vec::new();
+        let mut emit = |name, encoding, fields: &[(&str, u64)]| {
+            code.extend(encode(name, encoding, fields, None).unwrap());
+        };
+        emit("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)]);
+        for part in 0..24 {
+            // A user SGPR chooses one region to skip. The remaining stores occupy distinct
+            // 32-lane regions so the optimizer has to preserve the guest's control flow.
+            emit("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128 + part)]);
+            emit("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]);
+            emit("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 0), ("VADDR", 1), ("SRSRC", 0),
+                ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 128 * part)]);
+        }
+        emit("S_ENDPGM", "ENC_SOPP", &[]);
+        let cfg = Cfg::build(&code).unwrap();
+        let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 5, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let entry = Entry::Compute(cs);
+        let kernel = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let opts = DispatchOptions {
+            compact: None, nest: None, tables: super::super::compact::TABLE_WORDS_WAVE32,
+            split_limit: 96, prefer_split_chain: false,
+            // Present a small candidate to the real automatic selection path without relying
+            // on the production profitability threshold of 20,000 guest instructions.
+            auto_plan: |cfg, lw, _, _| super::super::compact::plan(cfg, lw),
+        };
+        let compact = translate_cfg(&cfg, kernel, &entry, opts).unwrap();
+        let ordinary = translate_cfg(&cfg, kernel, &entry, DispatchOptions {
+            compact: Some(false), prefer_split_chain: true, ..opts
+        }).unwrap();
+        let combined = translate_cfg(&cfg, kernel, &entry, DispatchOptions { prefer_split_chain: true, ..opts }).unwrap();
+        let forced_compact = translate_cfg(&cfg, kernel, &entry, DispatchOptions {
+            compact: Some(true), prefer_split_chain: true, ..opts
+        }).unwrap();
+        let split_disabled = translate_cfg(&cfg, kernel, &entry, DispatchOptions {
+            split_limit: 0, prefer_split_chain: true, ..opts
+        }).unwrap();
+        assert!(compact.dispatch_chain.is_none());
+        assert!(forced_compact.dispatch_chain.is_none());
+        assert!(split_disabled.dispatch_chain.is_none());
+        assert_ne!(compact.dxil, ordinary.dxil);
+        assert_eq!(combined.dxil, compact.dxil);
+        let ordinary_chain = ordinary.dispatch_chain.as_ref().expect("ordinary compute yields a split plan");
+        let combined_chain = combined.dispatch_chain.as_ref().expect("preserved ordinary split plan");
+        assert_eq!(combined_chain.pieces, ordinary_chain.pieces);
+        assert_eq!(combined_chain.dwords_per_group, ordinary_chain.dwords_per_group);
+        assert_eq!(combined.static_samplers, ordinary.static_samplers);
+        println!("COMPACT_CHAIN whole={} B ordinary={} B pieces={} scratch={} dwords/group",
+            combined.dxil.len(), ordinary.dxil.len(), combined_chain.pieces.len(), combined_chain.dwords_per_group);
+    }
+
+    #[test]
+    fn compact_chain_rejects_ordinary_pieces_with_a_different_sampler_order() {
+        let a = ([1, 2, 3, 4], false);
+        let b = ([5, 6, 7, 8], true);
+        let mut compact = Kernel { dxil: vec![], static_samplers: vec![a, b], dispatch_chain: None };
+        let ordinary = Kernel {
+            dxil: vec![], static_samplers: vec![b, a],
+            dispatch_chain: Some(std::sync::Arc::new(DispatchChain { pieces: vec![vec![1], vec![2]], dwords_per_group: 1 })),
+        };
+        retain_ordinary_chain(&mut compact, ordinary);
+        assert!(compact.dispatch_chain.is_none());
+        assert_eq!(compact.static_samplers, [a, b]);
+    }
 }
 
 /// True when a pixel shader uses RDNA2 Primitive Ordered Pixel Shading (POPS):
