@@ -491,6 +491,132 @@ mod chain_preservation_tests {
     use super::*;
     use crate::gpu::rdna2::encode;
 
+    const PROFITABLE_REGIONS: usize = 240;
+    const MIX_ROUNDS: usize = 28;
+    const MIX_MULTIPLIER: u32 = 1_103_515_245;
+    const PROFITABLE_GUEST_BYTES: usize = 142_092;
+
+    fn profitable_compute_fixture() -> Vec<u8> {
+        fn emit(code: &mut Vec<u8>, name: &str, encoding: &str, fields: &[(&str, u64)], literal: Option<u32>) {
+            code.extend(encode(name, encoding, fields, literal).unwrap());
+        }
+
+        let mut code = Vec::new();
+        emit(&mut code, "V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None);
+        emit(&mut code, "S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None);
+
+        let mut region = Vec::new();
+        // Mix the lane's address with user SGPR 4 so the guarded store consumes all 28 rounds.
+        emit(&mut region, "V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 1)], None);
+        for _ in 0..MIX_ROUNDS {
+            emit(&mut region, "V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 258), ("SRC1", 255)], Some(MIX_MULTIPLIER));
+            emit(&mut region, "V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 144), ("VSRC1", 2)], None);
+            emit(&mut region, "V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 259), ("VSRC1", 2)], None);
+        }
+        // Skip the one-word store when the user SGPR matches the region index in s5.
+        emit(&mut region, "S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 5)], None);
+        emit(&mut region, "S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)], None);
+        emit(&mut region, "BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 1), ("SRSRC", 0),
+            ("SOFFSET", 128), ("OFFEN", 1)], None);
+        emit(&mut region, "S_ADD_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 129)], None);
+        emit(&mut region, "V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 1)], Some(128));
+
+        // These repeated bodies exceed the automatic profitability threshold and keep the ordinary CFG acyclic.
+        for _ in 0..PROFITABLE_REGIONS {
+            code.extend_from_slice(&region);
+        }
+        emit(&mut code, "S_ENDPGM", "ENC_SOPP", &[], None);
+        code
+    }
+
+    fn translate_profitable_compute_fixture() -> Kernel {
+        let code = profitable_compute_fixture();
+        assert_eq!(code.len(), PROFITABLE_GUEST_BYTES);
+        let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 5, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let kernel = translate_compute_on(&code, options, &cs, true).expect("translate through the normal compute entry");
+        assert!(!kernel.dxil.is_empty());
+        assert!(kernel.static_samplers.is_empty());
+        kernel
+    }
+
+    fn serialize_profitable_chain(chain: &DispatchChain) -> Vec<u8> {
+        let mut bytes = chain.dwords_per_group.to_le_bytes().to_vec();
+        for piece in &chain.pieces {
+            assert!(!piece.is_empty());
+            // Including each length verifies piece order and boundaries as well as the DXIL bytes.
+            bytes.extend_from_slice(&u64::try_from(piece.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(piece);
+        }
+        bytes
+    }
+
+    #[test]
+    fn normal_compute_entry_records_profitable_translation() {
+        let Some(output) = std::env::var_os("XCL_TEST_COMPACT_CHAIN_TRANSLATION_DIR") else { return; };
+        let output = std::path::PathBuf::from(output);
+        let compact = compact_mode();
+        let prefer_split = prefer_split_chain();
+        assert_eq!(dispatch_piece_limit(), 2_048);
+        let slot_reuse = std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some();
+        let phi_cse = std::env::var_os("XCL_SAMPLE_PHI_CSE").is_some();
+        let kernel = translate_profitable_compute_fixture();
+        std::fs::write(output.join("whole.dxil"), &kernel.dxil).expect("write whole DXIL");
+        let (pieces, stride) = if let Some(chain) = &kernel.dispatch_chain {
+            std::fs::write(output.join("chain.bin"), serialize_profitable_chain(chain)).expect("write ordinary chain");
+            (chain.pieces.len(), chain.dwords_per_group)
+        } else {
+            (0, 0)
+        };
+        println!("COMPACT_CHAIN_TRANSLATION compact={compact:?} prefer_split={prefer_split} slot_reuse={slot_reuse} phi_cse={phi_cse} guest_bytes={PROFITABLE_GUEST_BYTES} whole_bytes={} pieces={pieces} scratch_dwords={stride}", kernel.dxil.len());
+    }
+
+    #[test]
+    fn gpu_normal_compute_entry_preserves_profitable_split_and_compact_fallback() {
+        if !std::env::var("XCL_TEST_COMPACT_CHAIN_NORMAL_ENTRY_NATIVE").is_ok_and(|value| value == "1") { return; }
+        assert_eq!(compact_mode(), None, "fixture must let the normal planner choose compact");
+        assert!(prefer_split_chain());
+        assert_eq!(dispatch_piece_limit(), 2_048);
+        assert!(std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_none());
+        assert!(std::env::var_os("XCL_SAMPLE_PHI_CSE").is_none());
+
+        let references = std::path::PathBuf::from(std::env::var_os("XCL_TEST_COMPACT_CHAIN_REFERENCE_DIR")
+            .expect("set the directory of the forced normal-entry CPU controls"));
+        let ordinary = std::fs::read(references.join("ordinary/chain.bin")).expect("read the forced ordinary chain");
+        let compact = std::fs::read(references.join("compact/whole.dxil")).expect("read the forced compact whole");
+        let kernel = translate_profitable_compute_fixture();
+        let chain = kernel.dispatch_chain.as_ref().expect("preserved ordinary split plan");
+        assert_eq!(chain.pieces.len(), 24);
+        assert!(serialize_profitable_chain(chain) == ordinary, "automatic chain differs from forced ordinary");
+        assert!(kernel.dxil == compact, "automatic whole differs from forced compact");
+        println!("COMPACT_CHAIN_NORMAL_ENTRY guest_bytes={PROFITABLE_GUEST_BYTES} whole_bytes={} pieces={} scratch_dwords={}",
+            kernel.dxil.len(), chain.pieces.len(), chain.dwords_per_group);
+
+        if let Err(reason) = crate::gpu::recomp::runner::adapter() {
+            crate::gpu::recomp::runner::skip_test(&format!("no GPU: {reason}"));
+            return;
+        }
+
+        const LANES: usize = 32;
+        const WORDS: usize = PROFITABLE_REGIONS * LANES;
+        const SKIPPED_REGION: usize = 7;
+        const GUARD: u32 = 0xaabb_ccdd;
+        let input = vec![GUARD; WORDS + 16];
+        let mut expected = input.clone();
+        for (i, word) in expected[..WORDS].iter_mut().enumerate() {
+            if i / LANES == SKIPPED_REGION { continue; }
+            let mut mixed = SKIPPED_REGION as u32 ^ (i as u32 * 4);
+            for _ in 0..MIX_ROUNDS {
+                mixed = mixed.wrapping_mul(MIX_MULTIPLIER);
+                mixed ^= mixed >> 16;
+            }
+            *word = mixed;
+        }
+        let sgprs = [0, 0, (WORDS * 4) as u32, 0, SKIPPED_REGION as u32];
+        crate::hle::d3d12x::real::verify_compact_chain_outputs(&kernel, &sgprs, &input, &expected)
+            .expect("native profitable split dispatch and compact whole fallback");
+    }
+
     fn compact_chain_fixture() -> (Cfg, KernelOptions, Entry, DispatchOptions) {
         let mut code = Vec::new();
         let mut emit = |name, encoding, fields: &[(&str, u64)]| {
