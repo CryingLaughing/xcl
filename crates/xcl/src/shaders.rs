@@ -1218,12 +1218,60 @@ struct Pipelines {
     capped_bytes: AtomicUsize,
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
-    running: (Mutex<usize>, std::sync::Condvar),
+    running: (Mutex<PipelineAdmission>, std::sync::Condvar),
     most: usize,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+struct PipelineAdmission {
+    active: usize,
+    probe: Option<SplitGateProbe>,
+}
+
+#[derive(Default)]
+struct SplitGateProbe {
+    admitted: usize,
+    peak_active: usize,
+    waited: usize,
+    waiters: usize,
+    peak_waiters: usize,
+    cached_waited: usize,
+    cached_waiters: usize,
+    peak_cached_waiters: usize,
+    waiting_cache_bytes: usize,
+    peak_waiting_cache_bytes: usize,
+    total_wait: std::time::Duration,
+    max_wait: std::time::Duration,
+}
+
+impl SplitGateProbe {
+    fn begin_wait(&mut self, cached_bytes: Option<usize>) -> std::time::Instant {
+        self.waited += 1;
+        self.waiters += 1;
+        self.peak_waiters = self.peak_waiters.max(self.waiters);
+        if let Some(bytes) = cached_bytes {
+            self.cached_waited += 1;
+            self.cached_waiters += 1;
+            self.peak_cached_waiters = self.peak_cached_waiters.max(self.cached_waiters);
+            self.waiting_cache_bytes += bytes;
+            self.peak_waiting_cache_bytes = self.peak_waiting_cache_bytes.max(self.waiting_cache_bytes);
+        }
+        std::time::Instant::now()
+    }
+
+    fn end_wait(&mut self, began: std::time::Instant, cached_bytes: Option<usize>) {
+        self.waiters -= 1;
+        if let Some(bytes) = cached_bytes {
+            self.cached_waiters -= 1;
+            self.waiting_cache_bytes -= bytes;
+        }
+        let elapsed = began.elapsed();
+        self.total_wait += elapsed;
+        self.max_wait = self.max_wait.max(elapsed);
+    }
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1422,12 +1470,21 @@ impl Pipelines {
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
+            let probe_enabled = std::env::var("XCL_SPLIT_GATE_PROBE").as_deref() == Ok("1");
             let dev = if sel == crate::gpu::adapter::Selector::Warp {
                 let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
-                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+                let dev = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+                if probe_enabled { println!("split gate adapter: WARP"); }
+                dev
             } else {
-                let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-                crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+                let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+                if probe_enabled {
+                    let name = crate::gpu::adapter::name(&desc);
+                    let luid = desc.AdapterLuid;
+                    println!("split gate adapter: {name} LUID={:08x}:{:08x}", luid.HighPart, luid.LowPart);
+                }
+                dev
             };
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
@@ -1441,7 +1498,13 @@ impl Pipelines {
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
                 capped_bytes: AtomicUsize::new(0),
-                running: (Mutex::new(0), std::sync::Condvar::new()),
+                running: (
+                    Mutex::new(PipelineAdmission {
+                        active: 0,
+                        probe: probe_enabled.then(SplitGateProbe::default),
+                    }),
+                    std::sync::Condvar::new(),
+                ),
                 most,
                 max_dxil,
                 #[cfg(test)]
@@ -1537,11 +1600,25 @@ impl Pipelines {
             return;
         }
         {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
+            let mut admission = self.running.0.lock().unwrap();
+            let cached_bytes = cached.as_ref().map(Vec::len);
+            let began = if admission.active >= self.most {
+                admission.probe.as_mut().map(|probe| probe.begin_wait(cached_bytes))
+            } else {
+                None
+            };
+            while admission.active >= self.most {
+                admission = self.running.1.wait(admission).unwrap();
             }
-            *n += 1;
+            admission.active += 1;
+            let active = admission.active;
+            if let Some(probe) = admission.probe.as_mut() {
+                if let Some(began) = began {
+                    probe.end_wait(began, cached_bytes);
+                }
+                probe.admitted += 1;
+                probe.peak_active = probe.peak_active.max(active);
+            }
         }
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
@@ -1557,7 +1634,7 @@ impl Pipelines {
             if let Some(path) = path.as_deref() {
                 let _ = std::fs::remove_file(path);
             }
-            *self.running.0.lock().unwrap() -= 1;
+            self.running.0.lock().unwrap().active -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
@@ -1581,7 +1658,7 @@ impl Pipelines {
             }
             pso
         };
-        *self.running.0.lock().unwrap() -= 1;
+        self.running.0.lock().unwrap().active -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
@@ -1816,6 +1893,17 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        let admission = p.running.0.lock().unwrap();
+        if let Some(probe) = &admission.probe {
+            println!(
+                "split gate probe: limit={} admitted={} peak_active={} waited={} peak_waiters={} cached_waited={} peak_cached_waiters={} peak_waiting_cache_bytes={} total_wait_ns={} max_wait_ns={} active_end={} waiters_end={} waiting_cache_bytes_end={}",
+                p.most, probe.admitted, probe.peak_active, probe.waited, probe.peak_waiters,
+                probe.cached_waited, probe.peak_cached_waiters, probe.peak_waiting_cache_bytes,
+                probe.total_wait.as_nanos(), probe.max_wait.as_nanos(), admission.active,
+                probe.waiters, probe.waiting_cache_bytes,
+            );
+        }
+        drop(admission);
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
