@@ -1208,6 +1208,7 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    cache_identity: Option<CacheIdentityProbe>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
@@ -1224,6 +1225,42 @@ struct Pipelines {
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct CacheIdentityProbe {
+    cached_calls: AtomicUsize,
+    cached_success: AtomicUsize,
+    uncached_calls: AtomicUsize,
+    equal_bytes: AtomicUsize,
+    equal_length_different: AtomicUsize,
+    different_length: AtomicUsize,
+    unavailable: AtomicUsize,
+}
+
+impl CacheIdentityProbe {
+    fn record_success(
+        &self,
+        supplied: &[u8],
+        returned: Option<(&windows::Win32::Graphics::Direct3D::ID3DBlob, usize)>,
+    ) {
+        self.cached_success.fetch_add(1, Ordering::Relaxed);
+        let count = match returned {
+            Some((_, size)) if size != supplied.len() => &self.different_length,
+            Some((blob, size)) if size != 0 => {
+                let pointer = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                if pointer.is_null() {
+                    &self.unavailable
+                } else {
+                    // Compare only while `blob` owns the driver-provided buffer.
+                    let returned_bytes = unsafe { std::slice::from_raw_parts(pointer, size) };
+                    if returned_bytes == supplied { &self.equal_bytes } else { &self.equal_length_different }
+                }
+            }
+            _ => &self.unavailable,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 struct PipelineAdmission {
@@ -1471,6 +1508,7 @@ impl Pipelines {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
             let probe_enabled = std::env::var("XCL_SPLIT_GATE_PROBE").as_deref() == Ok("1");
+            let cache_identity = std::env::var("XCL_PSO_BLOB_IDENTITY_PROBE").as_deref() == Ok("1");
             let dev = if sel == crate::gpu::adapter::Selector::Warp {
                 let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
                 let dev = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
@@ -1491,6 +1529,7 @@ impl Pipelines {
             Ok(Pipelines {
                 dev,
                 signatures: Mutex::new(Default::default()),
+                cache_identity: cache_identity.then(CacheIdentityProbe::default),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
@@ -1622,11 +1661,21 @@ impl Pipelines {
         }
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
+            if let Some(probe) = &self.cache_identity {
+                probe.cached_calls.fetch_add(1, Ordering::Relaxed);
+            }
             // a driver that cannot use the blob may compile from the DXIL itself and still
             // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
             unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
                 .ok()
-                .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
+                .filter(|pso| {
+                    let blob = unsafe { pso.GetCachedBlob() };
+                    let returned = blob.as_ref().ok().map(|blob| (blob, unsafe { blob.GetBufferSize() }));
+                    if let Some(probe) = &self.cache_identity {
+                        probe.record_success(bytes, returned);
+                    }
+                    returned.is_some_and(|(_, size)| size == bytes.len())
+                })
         });
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
         // size cap and start the expensive uncached driver compile.
@@ -1646,6 +1695,9 @@ impl Pipelines {
             Ok(pso)
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            if let Some(probe) = &self.cache_identity {
+                probe.uncached_calls.fetch_add(1, Ordering::Relaxed);
+            }
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
@@ -1893,6 +1945,15 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        if let Some(probe) = &p.cache_identity {
+            println!(
+                "split gate cache identity: cached_calls={} cached_success={} uncached_calls={} equal_bytes={} equal_length_different={} different_length={} unavailable={}",
+                probe.cached_calls.load(Ordering::Relaxed), probe.cached_success.load(Ordering::Relaxed),
+                probe.uncached_calls.load(Ordering::Relaxed), probe.equal_bytes.load(Ordering::Relaxed),
+                probe.equal_length_different.load(Ordering::Relaxed), probe.different_length.load(Ordering::Relaxed),
+                probe.unavailable.load(Ordering::Relaxed),
+            );
+        }
         let admission = p.running.0.lock().unwrap();
         if let Some(probe) = &admission.probe {
             println!(
