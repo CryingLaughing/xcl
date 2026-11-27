@@ -803,8 +803,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * n);
                     if super::title_textures::any() {
                         // each barrier: type | flags, resource, subresource | before, after
-                        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
-                            b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
+                        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> = b.chunks_exact(4)
+                            .filter(|c| {
+                                let kind = c[0] as i32;
+                                let flags = (c[0] >> 32) as i32;
+                                kind == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION.0
+                                    && flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 == 0
+                            })
+                            .map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32)))
+                            .collect();
                         super::title_textures::note_transitions(st.pc, &t);
                     }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));

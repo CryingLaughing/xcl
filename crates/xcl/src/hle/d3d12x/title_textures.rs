@@ -1813,6 +1813,99 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
+    #[test]
+    fn replayed_console_split_barrier_notes_only_the_end() {
+        use super::super::{backend, console_list, real, Backend};
+        use windows::core::IUnknown;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        println!("console split barrier: initializing the D3D12 backend");
+        if backend() != Backend::Real || real::uma_gpu_va() == 0 {
+            crate::gpu::recomp::runner::skip_test("no GPU for console list replay");
+            return;
+        }
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let device = real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&device).unwrap();
+            let luid = dev.GetAdapterLuid();
+            println!("console split barrier adapter: {}, LUID {:08X}:{:08X}", real::stats().adapter, luid.HighPart, luid.LowPart);
+            let before = D3D12_RESOURCE_STATE_COPY_DEST;
+            let after = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64,
+                DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut resource: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, before, None, &mut resource).unwrap();
+            let resource = resource.unwrap();
+            let res = resource.as_raw() as usize;
+            let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+            // A tracked native texture without pending uploads or backing title bytes.
+            let va = 0x7E58_0000_0000usize;
+            TEXTURES.lock().unwrap().insert(res, Entry {
+                device: device as usize, va, src: va, in_gpu_view: false, tex, states: vec![before],
+                pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0,
+            });
+            TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
+            struct RegisteredTexture(usize);
+            impl Drop for RegisteredTexture {
+                fn drop(&mut self) { forget(self.0); }
+            }
+            let _registered = RegisteredTexture(res);
+
+            let make_list = |flags: D3D12_RESOURCE_BARRIER_FLAGS| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let pc = real::create_raw_pc_command_list(
+                    device, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.as_raw() as usize, 0,
+                ).expect("native backing for the console recording");
+                let raw = console_list::create_with_allocator(pc, alloc.as_raw());
+                let console = IUnknown::from_raw(raw);
+                let barrier = [
+                    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION.0 as u32, flags.0 as u32,
+                    res as u32, (res >> 32) as u32, 0, before.0 as u32, after.0 as u32, 0,
+                ];
+                // The wrapped list exposes the console ResourceBarrier slot.
+                let vtable = *(raw as *const *const usize);
+                let record: unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8]) =
+                    std::mem::transmute(*vtable.add(26));
+                record(raw, 1, &barrier);
+                assert_eq!(console_list::close(raw).unwrap().barriers, 1);
+                let pc = console_list::pc_list(raw).unwrap() as usize;
+                let notes = LIST_NOTES.lock().unwrap().get(&pc).cloned().unwrap_or_default();
+                (alloc, console, notes)
+            };
+            let begin = make_list(D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY);
+            let end = make_list(D3D12_RESOURCE_BARRIER_FLAG_END_ONLY);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let tracked_states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
+            let submit = |list: &IUnknown| {
+                let list = list.as_raw();
+                (queue.vtable().ExecuteCommandLists)(queue.as_raw(), 1, &list);
+            };
+            // Complete the split barrier even when the first submission publishes the wrong state.
+            submit(&begin.1);
+            let after_begin = tracked_states();
+            submit(&end.1);
+            if let Err(error) = texture::wait(dev, &queue) {
+                std::mem::forget((queue, begin, end, resource));
+                panic!("console split-barrier queue completion: {error}");
+            }
+            let final_states = tracked_states();
+            println!(
+                "console split barrier notes: BEGIN={}, END={}, after_begin={:#x}, final={:#x}",
+                begin.2.len(), end.2.len(), after_begin[0].0, final_states[0].0,
+            );
+            assert_eq!(end.2, vec![(res, 0, after)], "END_ONLY must note the completed transition");
+            assert_eq!(final_states, vec![after]);
+            assert!(begin.2.is_empty(), "BEGIN_ONLY must not record a completed transition");
+            assert_eq!(after_begin, vec![before], "BEGIN_ONLY must not advance the tracked texture state");
+        }
+    }
+
     /// The title's bytes are used where they are when all of them are readable, and read with the
     /// pages that are not committed as zeros otherwise – the same bytes either way.
     #[test]
