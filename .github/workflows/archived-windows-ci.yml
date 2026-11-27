@@ -1,0 +1,58 @@
+name: Supplemental Windows verification
+
+on:
+  push:
+    branches: [test/archived-windows-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.repository == 'CryingLaughing/xcl'
+    name: Windows no GPU (${{ matrix.candidate }})
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - candidate: '#2818'
+            revision: '138e36d6f56e3b6112bf0fa935a9147e9eb5d71c'
+          - candidate: '#2810'
+            revision: 'fe87896d84ad581ac8a25b275d0889eaf938f2b0'
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      XCL_NETWORK: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ matrix.revision }}
+          persist-credentials: false
+
+      - name: Verify the archived checkout
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ matrix.revision }}
+        run: |
+          $revision = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $revision -ne $env:EXPECTED_REVISION) {
+            throw 'The checkout differs from the archived candidate'
+          }
+          if (@(git status --porcelain).Count -ne 0 -or $LASTEXITCODE -ne 0) {
+            throw 'The candidate checkout is dirty'
+          }
+          "Candidate $revision"
+          "Tree $(git rev-parse 'HEAD^{tree}')"
+
+      - name: Rust (stable, MSVC)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Build and test
+        shell: pwsh
+        run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
